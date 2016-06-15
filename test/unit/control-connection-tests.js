@@ -1,15 +1,17 @@
 "use strict";
 var assert = require('assert');
-var async = require('async');
 var events = require('events');
+var rewire = require('rewire');
+var dns = require('dns');
 
 var helper = require('../test-helper.js');
-var ControlConnection = require('../../lib/control-connection.js');
+var ControlConnection = require('../../lib/control-connection');
 var Host = require('../../lib/host').Host;
 var utils = require('../../lib/utils');
 var Metadata = require('../../lib/metadata');
 var types = require('../../lib/types');
-var clientOptions = require('../../lib/client-options.js');
+var clientOptions = require('../../lib/client-options');
+var ProfileManager = require('../../lib/execution-profile').ProfileManager;
 
 describe('ControlConnection', function () {
   describe('constructor', function () {
@@ -18,31 +20,85 @@ describe('ControlConnection', function () {
       helper.assertInstanceOf(cc.metadata, Metadata);
     });
   });
+  describe('#init()', function () {
+    var useLocalhost;
+    before(function (done) {
+      dns.resolve('localhost', function (err) {
+        if (err) {
+          helper.trace('localhost can not be resolved');
+        }
+        useLocalhost = !err;
+        done();
+      });
+    });
+    it('should resolve IPv4 and IPv6 addresses', function (done) {
+      if (!useLocalhost) {
+        return done();
+      }
+      var cc = new ControlConnection(clientOptions.extend({ contactPoints: ['localhost'] }));
+      cc.getConnection = helper.callbackNoop;
+      cc.refreshOnConnection = helper.callbackNoop;
+      cc.init(function (err) {
+        assert.ifError(err);
+        var hosts = cc.hosts.values();
+        assert.strictEqual(hosts.length, 2);
+        assert.deepEqual(hosts.map(function (h) { return h.address; }), [ '127.0.0.1:9042', '::1:9042' ]);
+        done();
+      });
+    });
+    it('should resolve all IPv4 and IPv6 addresses provided by dns.resolve()', function (done) {
+      var ControlConnectionMock = rewire('../../lib/control-connection');
+      ControlConnectionMock.__set__('dns', {
+        resolve4: function (name, cb) {
+          cb(null, ['1', '2']);
+        },
+        resolve6: function (name, cb) {
+          cb(null, ['10', '20']);
+        }
+      });
+      var cc = new ControlConnectionMock(clientOptions.extend({ contactPoints: ['my-host-name'] }));
+      cc.getConnection = helper.callbackNoop;
+      cc.refreshOnConnection = helper.callbackNoop;
+      cc.init(function (err) {
+        assert.ifError(err);
+        //noinspection JSUnresolvedVariable
+        var hosts = cc.hosts.values();
+        assert.strictEqual(hosts.length, 4);
+        assert.deepEqual(hosts.map(function (h) { return h.address; }), [ '1:9042', '2:9042', '10:9042', '20:9042' ]);
+        done();
+      });
+    });
+  });
   describe('#nodeSchemaChangeHandler()', function () {
     it('should update keyspace metadata information', function () {
       var cc = new ControlConnection(clientOptions.extend({}, helper.baseOptions));
       cc.log = helper.noop;
-      var ksName = 'dummy';
-      //mock connection
-      cc.connection = {
-        sendStream: function (a, b, c) {
-          c(null, {rows: [{'keyspace_name': ksName, 'strategy_options': null}]});
-        }
+      var ksName = 'ks1';
+      var refreshedKeyspaces = [];
+      var refreshedObjects = [];
+      cc.scheduleKeyspaceRefresh = function (name, b, cb) {
+        refreshedKeyspaces.push(name);
+        if (cb) cb();
       };
-      assert.strictEqual(Object.keys(cc.metadata.keyspaces).length, 0);
-      cc.nodeSchemaChangeHandler({schemaChangeType: 'CREATED', keyspace: ksName});
-      assert.ok(cc.metadata.keyspaces[ksName]);
-      cc.nodeSchemaChangeHandler({schemaChangeType: 'DROPPED', keyspace: ksName});
-      assert.strictEqual(typeof cc.metadata.keyspaces[ksName], 'undefined');
-      //check that the callback error does not throw
-      cc.connection.sendStream =  function (a, b, c) {
-        c(new Error('Fake error'));
+      cc.scheduleObjectRefresh = function (h, ks, cqlObject) {
+        h();
+        refreshedObjects.push(ks + '-' + (cqlObject || ''));
       };
-      assert.doesNotThrow(function () {
-        cc.nodeSchemaChangeHandler({schemaChangeType: 'CREATED', keyspace: ksName});
-      });
-      //and the keyspace was not added
-      assert.strictEqual(typeof cc.metadata.keyspaces[ksName], 'undefined');
+      cc.metadata.keyspaces = {};
+      cc.metadata.keyspaces[ksName] = { tables: { 'tbl1': {} }, views: {} };
+      cc.nodeSchemaChangeHandler({schemaChangeType: 'DROPPED', keyspace: ksName, isKeyspace: true});
+      assert.strictEqual(refreshedKeyspaces.length, 0);
+      assert.deepEqual(refreshedObjects, [ ksName + '-' ]);
+      cc.nodeSchemaChangeHandler({ schemaChangeType: 'CREATED', keyspace: ksName, isKeyspace: true});
+      assert.deepEqual(refreshedKeyspaces, [ ksName ]);
+      cc.nodeSchemaChangeHandler({ schemaChangeType: 'UPDATED', keyspace: ksName, isKeyspace: true});
+      assert.deepEqual(refreshedKeyspaces, [ ksName, ksName ]);
+      cc.nodeSchemaChangeHandler({ schemaChangeType: 'UPDATED', keyspace: ksName, isKeyspace: true});
+      assert.deepEqual(refreshedKeyspaces, [ ksName, ksName, ksName ]);
+      cc.metadata.keyspaces[ksName] = { tables: { 'tbl1': {} }, views: {} };
+      cc.nodeSchemaChangeHandler({ schemaChangeType: 'UPDATED', keyspace: ksName, table: 'tbl1'});
+      // clears the internal state
+      assert.ok(!cc.metadata.keyspaces[ksName].tables['tbl1']);
     });
   });
   describe('#nodeStatusChangeHandler()', function () {
@@ -50,31 +106,47 @@ describe('ControlConnection', function () {
       var options = clientOptions.extend({}, helper.baseOptions);
       var toStringCalled = false;
       var hostsGetCalled = false;
-      var cc = new ControlConnection(options);
+      var cc = newInstance(options);
       cc.hosts = { get : function () { hostsGetCalled = true;}};
       var event = { inet: { address: { toString: function () { toStringCalled = true; return 'host1';}}}};
       cc.nodeStatusChangeHandler(event);
       assert.strictEqual(toStringCalled, true);
       assert.strictEqual(hostsGetCalled, true);
     });
-    it('should set the node down', function () {
-      var downSet = false;
+    it('should set the node down when distance is ignored', function () {
+      var downSet = 0;
       var options = clientOptions.extend({}, helper.baseOptions);
-      var cc = new ControlConnection(options);
-      cc.hosts = { get : function () { return { setDown: function () { downSet = true;}} }};
+      var cc = newInstance(options);
+      cc.hosts = { get : function () { return {
+        setDown: function () { downSet++; },
+        setDistance: function () { return types.distance.ignored; }
+      }}};
       var event = { inet: { address: { toString: function () { return 'host1';}}}};
       cc.nodeStatusChangeHandler(event);
-      assert.strictEqual(downSet, true);
+      assert.strictEqual(downSet, 1);
+    });
+    it('should not set the node down when distance is not ignored', function () {
+      var downSet = 0;
+      var options = clientOptions.extend({}, helper.baseOptions);
+      var cc = newInstance(options);
+      cc.hosts = { get : function () { return {
+        setDown: function () { downSet++;},
+        datacenter: 'dc1',
+        setDistance: helper.noop
+      } }};
+      var event = { inet: { address: { toString: function () { return 'host1';}}}};
+      cc.nodeStatusChangeHandler(event);
+      assert.strictEqual(downSet, 0);
     });
   });
   describe('#getAddressForPeerHost()', function() {
     it('should handle null, 0.0.0.0 and valid addresses', function (done) {
       var options = clientOptions.extend({}, helper.baseOptions);
-      var cc = new ControlConnection(options);
+      var cc = newInstance(options);
       cc.host = new Host('2.2.2.2', 1, options);
       cc.log = helper.noop;
       var peer = getInet([100, 100, 100, 100]);
-      async.series([
+      utils.series([
         function (next) {
           var row = {'rpc_address': getInet([1, 2, 3, 4]), peer: peer};
           cc.getAddressForPeerHost(row, 9042, function (endPoint) {
@@ -109,7 +181,7 @@ describe('ControlConnection', function () {
         port = p;
         cb(addr + ':' + p);
       }};
-      var cc = new ControlConnection(options);
+      var cc = newInstance(options);
       cc.host = new Host('2.2.2.2', 1, options);
       cc.log = helper.noop;
       var row = {'rpc_address': getInet([5, 2, 3, 4]), peer: null};
@@ -123,7 +195,7 @@ describe('ControlConnection', function () {
   describe('#setPeersInfo()', function () {
     it('should use not add invalid addresses', function () {
       var options = clientOptions.extend({}, helper.baseOptions);
-      var cc = new ControlConnection(options);
+      var cc = newInstance(options);
       cc.host = new Host('18.18.18.18', 1, options);
       cc.log = helper.noop;
       var rows = [
@@ -147,7 +219,7 @@ describe('ControlConnection', function () {
     });
     it('should set the host datacenter and cassandra version', function () {
       var options = clientOptions.extend({}, helper.baseOptions);
-      var cc = new ControlConnection(options);
+      var cc = newInstance(options);
       //dummy
       cc.host = new Host('18.18.18.18', 1, options);
       cc.log = helper.noop;
@@ -173,7 +245,7 @@ describe('ControlConnection', function () {
   describe('#refreshOnConnection()', function () {
     it('should subscribe to current host events first in case IO fails', function (done) {
       var options = clientOptions.extend({}, helper.baseOptions);
-      var cc = new ControlConnection(options);
+      var cc = newInstance(options);
       cc.host = new Host('18.18.18.18:9042', 1, options);
       cc.log = helper.noop;
       var fakeError = new Error('fake error');
@@ -247,9 +319,9 @@ describe('ControlConnection', function () {
         newQueryPlan: function (k, o, cb) {
           cb(null, utils.arrayIterator(hosts));
         },
-        getDistance: helper.noop
+        getDistance: function () {return types.distance.local; }
       };
-      var cc = new ControlConnection(options);
+      var cc = newInstance(options);
       cc.getConnectionToNewHost(function (err, c, h) {
         assert.ifError(err);
         assert.strictEqual(h, hosts[0]);
@@ -269,9 +341,9 @@ describe('ControlConnection', function () {
         newQueryPlan: function (k, o, cb) {
           cb(new Error('test dummy error'));
         },
-        getDistance: helper.noop
+        getDistance: function () {return types.distance.local; }
       };
-      var cc = new ControlConnection(options);
+      var cc = newInstance(options);
       cc.hosts = { values: function () { return hosts; } };
       cc.getConnectionToNewHost(function (err, c, h) {
         assert.ifError(err);
@@ -292,10 +364,10 @@ describe('ControlConnection', function () {
         newQueryPlan: function (k, o, cb) {
           cb(null, utils.arrayIterator(hosts));
         },
-        getDistance: helper.noop
+        getDistance: function () {return types.distance.local; }
       };
       var listenCalled = 0;
-      var cc = new ControlConnection(options);
+      var cc = newInstance(options);
       cc.listenHostsForUp = function () {
         listenCalled++;
       };
@@ -322,11 +394,9 @@ describe('ControlConnection', function () {
         newQueryPlan: function (k, o, cb) {
           cb(null, utils.arrayIterator(hosts));
         },
-        getDistance: function () {
-          return types.distance.ignored;
-        }
+        getDistance: function () {return types.distance.ignored; }
       };
-      var cc = new ControlConnection(options);
+      var cc = newInstance(options);
       cc.listenHostsForUp = helper.noop;
       cc.getConnectionToNewHost(function (err, c, h) {
         assert.ifError(err);
@@ -345,4 +415,8 @@ describe('ControlConnection', function () {
  */
 function getInet(bytes) {
   return new types.InetAddress(new Buffer(bytes));
+}
+
+function newInstance(options) {
+  return new ControlConnection(options, new ProfileManager(options))
 }

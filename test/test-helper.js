@@ -1,4 +1,4 @@
-var async = require('async');
+"use strict";
 var assert = require('assert');
 var util = require('util');
 var path = require('path');
@@ -10,25 +10,19 @@ util.inherits(RetryMultipleTimes, policies.retry.RetryPolicy);
 
 var helper = {
   /**
-   * Execute the query per each parameter array into paramsArray
-   * @param {Connection|Client} con
-   * @param {String} query
-   * @param {Array} paramsArray Array of arrays of params
-   * @param {Function} callback
-   */
-  batchInsert: function (con, query, paramsArray, callback) {
-    async.mapSeries(paramsArray, function (params, next) {
-      con.execute(query, params, {consistency: types.consistencies.one}, next);
-    }, callback);
-  },
-  /**
    * Sync throws the error
+   * @type Function
    */
   throwop: function (err) {
     if (err) throw err;
   },
+  /** @type Function */
   noop: function () {
     //do nothing
+  },
+  /** @type Function */
+  failop: function () {
+    throw new Error('Method should not be called');
   },
   /**
    * Uses the last parameter as callback, invokes it via setImmediate
@@ -113,7 +107,11 @@ var helper = {
      * @param {Function} callback
      */
     startNode: function (nodeIndex, callback) {
-      new Ccm().exec(['node' + nodeIndex, 'start', '--wait-other-notice', '--wait-for-binary-proto'], callback);
+      var args = ['node' + nodeIndex, 'start', '--wait-other-notice', '--wait-for-binary-proto'];
+      if (process.platform.indexOf('win') === 0 && helper.isCassandraGreaterThan('2.2.4')) {
+        args.push('--quiet-windows')
+      }
+      new Ccm().exec(args, callback);
     },
     /**
      * @param {Number} nodeIndex 1 based index of the node
@@ -267,7 +265,7 @@ var helper = {
     //noinspection JSUnresolvedVariable
     var version = process.env.TEST_CASSANDRA_VERSION;
     if (!version) {
-      version = '2.1.4';
+      version = '3.0.5';
     }
     return version;
   },
@@ -477,31 +475,72 @@ var helper = {
   },
 
   /**
-   * The same as async.times, only no more than limit iterators will be
-   * simultaneously running at any time.
-   *
-   * Note that the items are not processed in batches, so there is no guarantee
-   * that the first limit iterator functions will complete before any others
-   * are started.
-   *
-   * Taken from https://github.com/caolan/async/pull/560.
-   *
-   * @param count The number of times to run the function.
-   * @param limit The maximum number of iterators to run at any time.
-   * @param iterator The function to call n times.
-   * @param callback The function to call on completion of iterators.
+   * Executes a function at regular intervals while the condition is false or the amount of attempts >= maxAttempts.
+   * @param {Function} condition
+   * @param {Number} delay
+   * @param {Number} maxAttempts
+   * @param {Function} done
    */
-  timesLimit: function(count, limit, iterator, callback) {
-    var counter = [];
-    for (var i = 0; i < count; i++) {
-      counter.push(i);
-    }
+  setIntervalUntil: function (condition, delay, maxAttempts, done) {
+    var attempts = 0;
+    utils.whilst(
+      function whilstCondition() {
+        return !condition();
+      },
+      function whilstItem(next) {
+        if (attempts++ >= maxAttempts) {
+          return next(new Error(util.format('Condition still false after %d attempts: %s', maxAttempts, condition)));
+        }
 
-    return async.mapLimit(counter, limit, iterator, callback);
+        setTimeout(next, delay);
+      },
+      done);
+  },
+  /**
+   * Returns a method that executes a function at regular intervals while the condition is false or the amount of
+   * attempts >= maxAttempts.
+   * @param {Function} condition
+   * @param {Number} delay
+   * @param {Number} maxAttempts
+   */
+  setIntervalUntilTask: function (condition, delay, maxAttempts) {
+    var self = this;
+    return (function setIntervalUntilHandler(done) {
+      self.setIntervalUntil(condition, delay, maxAttempts, done);
+    });
+  },
+  /**
+   * Returns a method that delays invoking the callback
+   */
+  delay: function (delayMs) {
+    return (function delayedHandler(next) {
+      setTimeout(next, delayMs);
+    });
   },
   queries: {
     basic: "SELECT key FROM system.local",
     basicNoResults: "SELECT key from system.local WHERE key = 'not_existent'"
+  },
+  /**
+   * @param {Object} o1
+   * @param {Object} o2
+   * @param {Array.<string>} props
+   * @param {Array.<string>} [except]
+   */
+  compareProps: function (o1, o2, props, except) {
+    assert.ok(o1);
+    if (except) {
+      props = props.slice(0);
+      except.forEach(function (p) {
+        var index = props.indexOf(p);
+        if (index >= 0) {
+          props.splice(index, 1);
+        }
+      });
+    }
+    props.forEach(function comparePropItem(p) {
+      assert.strictEqual(o1[p], o2[p]);
+    });
   }
 };
 
@@ -512,7 +551,7 @@ function Ccm() {
 /**
  * Removes previous and creates a new cluster (create, populate and start)
  * @param {Number|String} nodeLength number of nodes in the cluster. If multiple dcs, use the notation x:y:z:...
- * @param {{vnodes: Boolean, yaml: Array}} options
+ * @param {{vnodes: Boolean, yaml: Array, jvmArgs: Array, ssl: Boolean, sleep: Number, ipFormat: String}} options
  * @param {Function} callback
  */
 Ccm.prototype.startAll = function (nodeLength, options, callback) {
@@ -520,7 +559,7 @@ Ccm.prototype.startAll = function (nodeLength, options, callback) {
   options = options || {};
   var version = helper.getCassandraVersion();
   helper.trace('Starting test C* cluster v%s with %s node(s)', version, nodeLength);
-  async.series([
+  utils.series([
     function (next) {
       //it wont hurt to remove
       self.exec(['remove'], function () {
@@ -547,8 +586,9 @@ Ccm.prototype.startAll = function (nodeLength, options, callback) {
       if (!options.yaml) {
         return next();
       }
+      helper.trace('With conf', options.yaml);
       var i = 0;
-      async.whilst(
+      utils.whilst(
         function condition() {
           return i < options.yaml.length
         },
@@ -563,13 +603,21 @@ Ccm.prototype.startAll = function (nodeLength, options, callback) {
       if (options.vnodes) {
         populate.push('--vnodes');
       }
+      if (options.ipFormat) {
+        populate.push('--ip-format='+ options.ipFormat);
+      }
       self.exec(populate, helper.wait(options.sleep, next));
     },
     function (next) {
       var start = ['start', '--wait-for-binary-proto'];
+      if (process.platform.indexOf('win') === 0 && helper.isCassandraGreaterThan('2.2.4')) {
+        start.push('--quiet-windows')
+      }
       if (util.isArray(options.jvmArgs)) {
         options.jvmArgs.forEach(function (arg) {
-          start.push('--jvm_arg', arg);
+          // Windows requires jvm arguments to be quoted, while *nix requires unquoted.
+          var jvmArg = process.platform.indexOf('win') === 0 ? '"' + arg + '"' : arg;
+          start.push('--jvm_arg', jvmArg);
         }, this);
         helper.trace('With jvm args', options.jvmArgs);
       }
@@ -593,8 +641,8 @@ Ccm.prototype.spawn = function (processName, params, callback) {
   var originalProcessName = processName;
   var spawn = require('child_process').spawn;
   if (process.platform.indexOf('win') === 0) {
-    params = ['/c', processName].concat(params);
-    processName = 'cmd.exe';
+    params = ['-ExecutionPolicy', 'Unrestricted', processName].concat(params);
+    processName = 'powershell.exe';
   }
   var p = spawn(processName, params);
   var stdoutArray= [];
@@ -641,7 +689,7 @@ Ccm.prototype.waitForUp = function (callback) {
   var started = false;
   var retryCount = 0;
   var self = this;
-  async.whilst(function () {
+  utils.whilst(function () {
     return !started && retryCount < 10;
   }, function iterator (next) {
     self.exec(['node1', 'showlog'], function (err, info) {

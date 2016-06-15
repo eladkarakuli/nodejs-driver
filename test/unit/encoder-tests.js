@@ -1,6 +1,5 @@
 var assert = require('assert');
 var util = require('util');
-var async = require('async');
 var utils = require('../../lib/utils');
 
 var Encoder = require('../../lib/encoder');
@@ -632,6 +631,15 @@ describe('encoder', function () {
       var encoder = new Encoder(2, { encoding: { useUndefinedAsUnset: true}});
       assert.strictEqual(encoder.encode(undefined), null);
     });
+    it('should decode 0-length map values', function () {
+      var encoder = new Encoder(2, {});
+      var buffer = new Buffer('000100046b6579310000', 'hex');
+      var value = encoder.decode(buffer,
+        { code: types.dataTypes.map, info: [ { code: types.dataTypes.text }, { code: types.dataTypes.text } ]});
+      assert.ok(value);
+      assert.deepEqual(Object.keys(value), ['key1']);
+      assert.strictEqual(value['key1'], null);
+    });
   });
   describe('#setRoutingKey()', function () {
     var encoder = new Encoder(2, {});
@@ -901,7 +909,7 @@ describe('encoder', function () {
         ['timeuuid',   dataTypes.timeuuid],
         ['ascii',      dataTypes.ascii]
       ];
-      async.eachSeries(items, function eachCb(item, next) {
+      utils.eachSeries(items, function eachCb(item, next) {
         encoder.parseTypeName('ks1', item[0], 0, null, throwIfCalled, function (err, dataType) {
           assert.ifError(err);
           assert.ok(dataType);
@@ -921,7 +929,7 @@ describe('encoder', function () {
         ['frozen<list<timeuuid>>', dataTypes.list, dataTypes.timeuuid],
         ['map<text,frozen<list<int>>>', dataTypes.map, [dataTypes.text, dataTypes.list]]
       ];
-      async.eachSeries(items, function eachCb(item, next) {
+      utils.eachSeries(items, function eachCb(item, next) {
         encoder.parseTypeName('ks1', item[0], 0, null, throwIfCalled, function (err, dataType) {
           assert.ifError(err);
           assert.ok(dataType);
@@ -942,7 +950,7 @@ describe('encoder', function () {
     });
     it('should parse nested subtypes', function (done) {
       var encoder = new Encoder(4, {});
-      async.series([
+      utils.series([
         function (next) {
           var name = 'map<text,frozen<list<frozen<map<text,frozen<list<int>>>>>>>';
           encoder.parseTypeName('ks1', name, 0, null, throwIfCalled, function (err, type) {
@@ -963,7 +971,7 @@ describe('encoder', function () {
     });
     it('should parse udts', function (done) {
       var encoder = new Encoder(4, {});
-      async.series([
+      utils.series([
         function (next) {
           var called = 0;
           function udtResolver(ks, udtName, callback) {
@@ -1008,7 +1016,7 @@ describe('encoder', function () {
     });
     it('should parse quoted udts', function (done) {
       var encoder = new Encoder(4, {});
-      async.series([
+      utils.series([
         function (next) {
           var called = 0;
           function udtResolver(ks, udtName, callback) {

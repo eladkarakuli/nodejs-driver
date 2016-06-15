@@ -2,7 +2,6 @@
 var assert = require('assert');
 var util = require('util');
 var events = require('events');
-var async = require('async');
 
 var Client = require('../../lib/client.js');
 var clientOptions = require('../../lib/client-options.js');
@@ -522,48 +521,6 @@ describe('types', function () {
   });
 });
 describe('utils', function () {
-  describe('#syncEvent()', function () {
-    it('should execute callback once for all emitters', function () {
-      var emitter1 = new events.EventEmitter();
-      var emitter2 = new events.EventEmitter(); 
-      var emitter3 = new events.EventEmitter(); 
-      var callbackCounter = 0;
-      utils.syncEvent([emitter1, emitter2, emitter3], 'dummy', this, function (text){
-        assert.strictEqual(text, 'bop');
-        callbackCounter = callbackCounter + 1;
-      });
-      assert.ok(emitter1.emit('dummy', 'bip'));
-      emitter1.emit('dummy', 'bop');
-      emitter2.emit('dummy', 'bip');
-      emitter2.emit('dummy', 'bop');
-      emitter3.emit('dummy', 'bop');
-      assert.strictEqual(callbackCounter, 1);
-    });
-  });
-  describe('#parseCommonArgs()', function () {
-    it('parses args and can be retrieved by name', function () {
-      function testArgs(args, expectedLength) {
-        assert.strictEqual(args.length, expectedLength, 'The arguments length do not match');
-        assert.ok(args.query, 'Query must be defined');
-        assert.strictEqual(typeof args.callback, 'function', 'Callback must be a function ');
-        if (args && args.length > 2) {
-          assert.ok(util.isArray(args.params) || args.params === null, 'params must be an array or null');
-        }
-      }
-      var args = utils.parseCommonArgs('A QUERY 1', function (){});
-      assert.ok(args && args.query && args.callback);
-      assert.throws(utils.parseCommonArgs, Error, 'It must contain at least 2 arguments.');
-      args = utils.parseCommonArgs('A QUERY 2', [1, 2, 3], function (){});
-      testArgs(args, 3);
-      assert.ok(util.isArray(args.params) && args.params.length === 3);
-      args = utils.parseCommonArgs('A QUERY 3', [], function (){});
-      testArgs(args, 3);
-      assert.ok(util.isArray(args.params), 'Params should be set');
-      args = utils.parseCommonArgs('A QUERY', [1, 2, 3], {}, function (){});
-      testArgs(args, 4);
-      assert.ok(args.params && args.options, 'Params and options must not be null');
-    });
-  });
   describe('#extend()', function () {
     it('should allow null sources', function () {
       var originalObject = {};
@@ -816,10 +773,13 @@ describe('exports', function () {
     //policies modules
     assert.strictEqual(api.policies.loadBalancing, loadBalancing);
     assert.strictEqual(typeof api.policies.loadBalancing.LoadBalancingPolicy, 'function');
+    helper.assertInstanceOf(api.policies.defaultLoadBalancingPolicy(), api.policies.loadBalancing.LoadBalancingPolicy);
     assert.strictEqual(api.policies.retry, retry);
     assert.strictEqual(typeof api.policies.retry.RetryPolicy, 'function');
+    helper.assertInstanceOf(api.policies.defaultRetryPolicy(), api.policies.retry.RetryPolicy);
     assert.strictEqual(api.policies.reconnection, require('../../lib/policies/reconnection'));
     assert.strictEqual(typeof api.policies.reconnection.ReconnectionPolicy, 'function');
+    helper.assertInstanceOf(api.policies.defaultReconnectionPolicy(), api.policies.reconnection.ReconnectionPolicy);
     assert.strictEqual(api.auth, require('../../lib/auth'));
     //metadata module with classes
     assert.ok(api.metadata);
@@ -828,5 +788,6 @@ describe('exports', function () {
     assert.ok(api.Encoder);
     assert.strictEqual(typeof api.Encoder, 'function');
     assert.strictEqual(api.Encoder, require('../../lib/encoder'));
+    assert.ok(api.defaultOptions());
   });
 });

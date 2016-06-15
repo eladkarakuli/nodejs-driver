@@ -1,11 +1,12 @@
+'use strict';
 var assert = require('assert');
 var util = require('util');
-var async = require('async');
 
 var Encoder = require('../../lib/encoder');
 var streams = require('../../lib/streams');
 var errors = require('../../lib/errors');
 var types = require('../../lib/types');
+var utils = require('../../lib/utils');
 var helper = require('../test-helper');
 
 /**
@@ -44,9 +45,9 @@ describe('Parser', function () {
         done();
       });
       var header = getFrameHeader(5, types.opcodes.authenticate);
-      parser._transform({ header: header, chunk: new Buffer([0, 3])}, null, doneIfError(done));
-      parser._transform({ header: header, chunk: new Buffer('a')}, null, doneIfError(done));
-      parser._transform({ header: header, chunk: new Buffer('bc')}, null, doneIfError(done));
+      parser._transform({ header: header, chunk: new Buffer([0, 3]), offset: 0}, null, doneIfError(done));
+      parser._transform({ header: header, chunk: new Buffer('a'), offset: 0}, null, doneIfError(done));
+      parser._transform({ header: header, chunk: new Buffer('bc'), offset: 0}, null, doneIfError(done));
     });
     it('should read a VOID result', function (done) {
       var parser = newInstance();
@@ -82,22 +83,25 @@ describe('Parser', function () {
       var parser = newInstance();
       parser.on('readable', function () {
         var item = parser.read();
-        assert.strictEqual(item.header.bodyLength, 4);
+        assert.ok(!item.error);
+        assert.strictEqual(item.header.bodyLength, 20);
         assert.strictEqual(item.header.opcode, types.opcodes.result);
         helper.assertInstanceOf(item.flags.traceId, types.Uuid);
         assert.strictEqual(item.flags.traceId.getBuffer().slice(0, 6).toString('hex'), 'fffffffffafa');
         done();
       });
       parser._transform({
-        header: getFrameHeader(4, types.opcodes.result, 2, true),
-        chunk: new Buffer('fffffffffafa', 'hex') //first part of the uuid
+        header: getFrameHeader(20, types.opcodes.result, 2, true),
+        chunk: new Buffer('fffffffffafa', 'hex'), //first 6 bytes of the uuid
+        offset: 0
       }, null, doneIfError(done));
       parser._transform({
-        header: getFrameHeader(4, types.opcodes.result, 2, true),
+        header: getFrameHeader(20, types.opcodes.result, 2, true),
         chunk: Buffer.concat([
           new Buffer(10), //second part uuid
           new Buffer([0, 0, 0, types.resultKind.voidResult])
-        ])
+        ]),
+        offset: 0
       }, null, doneIfError(done));
     });
     it('should read a SET_KEYSPACE result', function (done) {
@@ -112,15 +116,18 @@ describe('Parser', function () {
       var bodyLength = 4 + 2 + 3;
       parser._transform({
         header: getFrameHeader(bodyLength, types.opcodes.result),
-        chunk: new Buffer([0, 0, 0, types.resultKind.setKeyspace])
+        chunk: new Buffer([0, 0, 0, types.resultKind.setKeyspace]),
+        offset: 0
       }, null, doneIfError(done));
       parser._transform({
         header: getFrameHeader(bodyLength, types.opcodes.result),
-        chunk: new Buffer([0, 3])
+        chunk: new Buffer([0, 3]),
+        offset: 0
       }, null, doneIfError(done));
       parser._transform({
         header: getFrameHeader(bodyLength, types.opcodes.result),
-        chunk: new Buffer('ks1')
+        chunk: new Buffer('ks1'),
+        offset: 0
       }, null, doneIfError(done));
     });
     it('should read a PREPARE result', function (done) {
@@ -148,15 +155,18 @@ describe('Parser', function () {
       var bodyLength = body.length;
       parser._transform({
         header: getFrameHeader(bodyLength, types.opcodes.result),
-        chunk: body.slice(0, 22)
+        chunk: body.slice(0, 22),
+        offset: 0
       }, null, doneIfError(done));
       parser._transform({
         header: getFrameHeader(bodyLength, types.opcodes.result),
-        chunk: body.slice(22, 41)
+        chunk: body.slice(22, 41),
+        offset: 0
       }, null, doneIfError(done));
       parser._transform({
         header: getFrameHeader(bodyLength, types.opcodes.result),
-        chunk: body.slice(41)
+        chunk: body.slice(41),
+        offset: 0
       }, null, doneIfError(done));
     });
     it('should read a STATUS_CHANGE UP EVENT response', function (done) {
@@ -198,8 +208,8 @@ describe('Parser', function () {
       var eventData = getEventData('STATUS_CHANGE', 'DOWN');
       var chunk1 = eventData.chunk.slice(0, 5);
       var chunk2 = eventData.chunk.slice(5);
-      parser._transform({header: eventData.header, chunk: chunk1}, null, doneIfError(done));
-      parser._transform({header: eventData.header, chunk: chunk2}, null, doneIfError(done));
+      parser._transform({header: eventData.header, chunk: chunk1, offset: 0}, null, doneIfError(done));
+      parser._transform({header: eventData.header, chunk: chunk2, offset: 0}, null, doneIfError(done));
     });
     it('should read a buffer until there is enough data', function (done) {
       var parser = newInstance();
@@ -211,11 +221,13 @@ describe('Parser', function () {
       });
       parser._transform({
         header: getFrameHeader(4, types.opcodes.result),
-        chunk: new Buffer([0])
+        chunk: new Buffer([ 0 ]),
+        offset: 0
       }, null, doneIfError(done));
       parser._transform({
         header: getFrameHeader(4, types.opcodes.result),
-        chunk: new Buffer([0, 0, types.resultKind.voidResult])
+        chunk: new Buffer([ 0, 0, types.resultKind.voidResult ]),
+        offset: 0
       }, null, doneIfError(done));
     });
     it('should emit empty result one column no rows', function (done) {
@@ -256,20 +268,135 @@ describe('Parser', function () {
           done();
         }
       });
+      parser.setOptions(33, { byRow: true });
       //3 columns, 2 rows
       parser._transform(getBodyChunks(3, rowLength, 0, 10), null, doneIfError(done));
       parser._transform(getBodyChunks(3, rowLength, 10, 32), null, doneIfError(done));
       parser._transform(getBodyChunks(3, rowLength, 32, 37), null, doneIfError(done));
       parser._transform(getBodyChunks(3, rowLength, 37, null), null, doneIfError(done));
     });
+    describe('with multiple chunk lengths', function () {
+      var parser = newInstance();
+      var result;
+      parser.on('readable', function () {
+        var item;
+        while (item = parser.read()) {
+          if (!item.row && item.frameEnded) {
+            continue;
+          }
+          assert.strictEqual(item.header.opcode, types.opcodes.result);
+          assert.ok(item.row);
+          result[item.header.streamId] = result[item.header.streamId] || [];
+          result[item.header.streamId].push(item.row);
+        }
+      });
+      [1, 3, 5, 13].forEach(function (chunkLength) {
+        it('should emit rows chunked with chunk length of ' + chunkLength, function () {
+          result = {};
+          var expected = [
+            { columnLength: 3, rowLength: 10 },
+            { columnLength: 5, rowLength: 5 },
+            { columnLength: 6, rowLength: 15 },
+            { columnLength: 6, rowLength: 5 },
+            { columnLength: 1, rowLength: 20 }
+          ];
+          var items = expected.map(function (item, index) {
+            parser.setOptions(index, { byRow: true });
+            return getBodyChunks(item.columnLength, item.rowLength, 0, null, null, index);
+          });
+          function transformChunkedItem(i) {
+            var item = items[i];
+            var chunkedItem = {
+              header: item.header,
+              offset: 0
+            };
+            for (var j = 0; j < item.chunk.length; j = j + chunkLength) {
+              var end = j + chunkLength;
+              if (end >= item.chunk.length) {
+                end = item.chunk.length;
+                chunkedItem.frameEnded = true;
+              }
+              var start = j;
+              if (start === 0) {
+                //sum a few bytes
+                chunkedItem.chunk = Buffer.concat([ new Buffer(9), item.chunk.slice(start, end) ]);
+                chunkedItem.offset = 9;
+              }
+              else {
+                chunkedItem.chunk = item.chunk.slice(start, end);
+                chunkedItem.offset = 0;
+              }
+              parser._transform(chunkedItem, null, helper.throwop);
+            }
+          }
+          for (var i = 0; i < items.length; i++) {
+            transformChunkedItem(i);
+          }
+          //assert result
+          expected.forEach(function (expectedItem, index) {
+            assert.ok(result[index], 'Result not found for index ' + index);
+            assert.strictEqual(result[index].length, expectedItem.rowLength);
+          });
+        });
+      });
+    });
+    describe('with multiple chunk lengths piped', function () {
+      var protocol = new streams.Protocol({ objectMode: true });
+      var parser = newInstance();
+      protocol.pipe(parser);
+      var result;
+      parser.on('readable', function () {
+        var item;
+        while (item = parser.read()) {
+          if (!item.row && item.frameEnded) {
+            continue;
+          }
+          assert.strictEqual(item.header.opcode, types.opcodes.result);
+          assert.ok(item.row);
+          result[item.header.streamId] = result[item.header.streamId] || [];
+          result[item.header.streamId].push(item.row);
+        }
+      });
+      var expected = [
+        { columnLength: 3, rowLength: 10 },
+        { columnLength: 5, rowLength: 5 },
+        { columnLength: 6, rowLength: 15 },
+        { columnLength: 6, rowLength: 15 },
+        { columnLength: 1, rowLength: 20 }
+      ];
+      [1, 2, 7, 11].forEach(function (chunkLength) {
+        it('should emit rows chunked with chunk length of ' + chunkLength, function () {
+          result = {};
+          var buffer = Buffer.concat(expected.map(function (expectedItem, index) {
+            parser.setOptions(index, { byRow: true });
+            var item = getBodyChunks(expectedItem.columnLength, expectedItem.rowLength, 0, null, null, index);
+            return Buffer.concat([ item.header.toBuffer(), item.chunk ]);
+          }));
+
+          for (var j = 0; j < buffer.length; j = j + chunkLength) {
+            var end = j + chunkLength;
+            if (end >= buffer.length) {
+              end = buffer.length;
+            }
+            protocol._transform(buffer.slice(j, end), null, helper.throwop);
+          }
+          //assert result
+          expected.forEach(function (expectedItem, index) {
+            assert.ok(result[index], 'Result not found for index ' + index);
+            assert.strictEqual(result[index].length, expectedItem.rowLength);
+            assert.strictEqual(result[index][0].keys().length, expectedItem.columnLength);
+          });
+        });
+      });
+    });
     it('should emit row with large row values', function (done) {
-      this.timeout(5000);
+      this.timeout(20000);
       //3mb value
       var cellValue = helper.fillArray(3 * 1024 * 1024, 74);
       //Add the length 0x00300000 of the value
       cellValue = [0, 30, 0, 0].concat(cellValue);
       var rowLength = 1;
-      async.series([function (next) {
+      utils.series([function (next) {
         var parser = newInstance();
         var rowCounter = 0;
         parser.on('readable', function () {
@@ -368,11 +495,13 @@ describe('Parser', function () {
       var bodyLength = 4 + 2;
       parser._transform({
         header: getFrameHeader(bodyLength, types.opcodes.authChallenge),
-        chunk: new Buffer([0, 0, 0, 2])
+        chunk: new Buffer([255, 254, 0, 0, 0, 2]),
+        offset: 2
       }, null, doneIfError(done));
       parser._transform({
         header: getFrameHeader(bodyLength, types.opcodes.authChallenge),
-        chunk: new Buffer([100, 100])
+        chunk: new Buffer([100, 100]),
+        offset: 0
       }, null, doneIfError(done));
     });
     it('should buffer ERROR response until complete', function (done) {
@@ -390,9 +519,9 @@ describe('Parser', function () {
       var header = new types.FrameHeader(4, 0, 33, types.opcodes.error, 9);
       parser.setOptions(33, { byRow: true });
       assert.strictEqual(parser.frameState({ header: header}).byRow, true);
-      parser._transform({ header: header, chunk: new Buffer([0, 0, 0, 0])}, null, doneIfError(done));
-      parser._transform({ header: header, chunk: new Buffer([0, 3])}, null, doneIfError(done));
-      parser._transform({ header: header, chunk: new Buffer('ERR')}, null, doneIfError(done));
+      parser._transform({ header: header, chunk: new Buffer([255, 0, 0, 0, 0]), offset: 1}, null, doneIfError(done));
+      parser._transform({ header: header, chunk: new Buffer([0, 3]), offset: 0}, null, doneIfError(done));
+      parser._transform({ header: header, chunk: new Buffer('ERR'), offset: 0}, null, doneIfError(done));
     });
     it('should not buffer RESULT ROWS response when byRow is enabled', function (done) {
       var parser = newInstance();
@@ -433,11 +562,17 @@ function newInstance(protocolVersion) {
  * Test Helper method to get a frame header with stream id 12
  * @returns {exports.FrameHeader}
  */
-function getFrameHeader(bodyLength, opcode, version, trace) {
-  return new types.FrameHeader(version || 2, trace ? 0x02 : 0, 12, opcode, bodyLength);
+function getFrameHeader(bodyLength, opcode, version, trace, streamId) {
+  if (typeof streamId === 'undefined') {
+    streamId = 12;
+  }
+  return new types.FrameHeader(version || 2, trace ? 0x02 : 0, streamId, opcode, bodyLength);
 }
 
-function getBodyChunks(columnLength, rowLength, fromIndex, toIndex, cellValue) {
+/**
+ * @returns {{header: FrameHeader, chunk: Buffer, offset: number}}
+ */
+function getBodyChunks(columnLength, rowLength, fromIndex, toIndex, cellValue, streamId) {
   var i;
   var fullChunk = [
     //kind
@@ -476,8 +611,9 @@ function getBodyChunks(columnLength, rowLength, fromIndex, toIndex, cellValue) {
   }
 
   return {
-    header: getFrameHeader(fullChunk.length, types.opcodes.result),
-    chunk: new Buffer(fullChunk.slice(fromIndex, toIndex || undefined))
+    header: getFrameHeader(fullChunk.length, types.opcodes.result, null, null, streamId),
+    chunk: new Buffer(fullChunk.slice(fromIndex, toIndex || undefined)),
+    offset: 0
   };
 }
 
@@ -503,7 +639,7 @@ function getEventData(eventType, value) {
  * Calls done in case there is an error
  */
 function doneIfError(done) {
-  return function (err) {
+  return function doneIfErrorCallback(err) {
     if (err) done(err);
   };
 }

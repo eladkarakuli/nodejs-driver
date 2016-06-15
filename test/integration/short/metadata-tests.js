@@ -1,6 +1,5 @@
 "use strict";
 var assert = require('assert');
-var async = require('async');
 
 var helper = require('../../test-helper');
 var Client = require('../../../lib/client');
@@ -16,62 +15,92 @@ describe('Metadata', function () {
   describe('#keyspaces', function () {
     it('should keep keyspace information up to date', function (done) {
       var client = newInstance();
-      client.connect(function (err) {
-        assert.ifError(err);
+      var nonSyncClient = newInstance({ isMetadataSyncEnabled: false });
+
+      function checkKeyspaceWithInfo(ks, strategy, optionName, optionValue) {
+        assert.ok(ks);
+        assert.strictEqual(ks.strategy, strategy);
+        assert.ok(ks.strategyOptions);
+        assert.strictEqual(ks.strategyOptions[optionName], optionValue);
+      }
+
+      function checkKeyspace(client, name, strategy, optionName, optionValue) {
         var m = client.metadata;
-        assert.ok(m);
-        assert.ok(m.keyspaces);
-        assert.ok(m.keyspaces['system']);
-        assert.ok(m.keyspaces['system'].strategy);
-        async.series([
-          helper.toTask(client.execute, client, "CREATE KEYSPACE ks1 WITH replication = {'class': 'SimpleStrategy', 'replication_factor' : 3}"),
-          helper.toTask(client.execute, client, "CREATE KEYSPACE ks2 WITH replication = {'class': 'SimpleStrategy', 'replication_factor' : 2}"),
-          helper.toTask(client.execute, client, "CREATE KEYSPACE ks3 WITH replication = {'class': 'SimpleStrategy', 'replication_factor' : 1}"),
-          helper.toTask(client.execute, client, "CREATE KEYSPACE ks4 WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1' : 1}")
-        ], function (err) {
-          function checkKeyspace(name, strategy, optionName, optionValue) {
-            var ks = m.keyspaces[name];
-            assert.ok(ks);
-            assert.strictEqual(ks.strategy, strategy);
-            assert.ok(ks.strategyOptions);
-            assert.strictEqual(ks.strategyOptions[optionName], optionValue);
-          }
-          assert.ifError(err);
-          assert.ok(Object.keys(m.keyspaces).length > 4);
-          checkKeyspace('ks1', 'org.apache.cassandra.locator.SimpleStrategy', 'replication_factor', '3');
-          checkKeyspace('ks2', 'org.apache.cassandra.locator.SimpleStrategy', 'replication_factor', '2');
-          checkKeyspace('ks3', 'org.apache.cassandra.locator.SimpleStrategy', 'replication_factor', '1');
-          checkKeyspace('ks4', 'org.apache.cassandra.locator.NetworkTopologyStrategy', 'datacenter1', '1');
-          client.execute("ALTER KEYSPACE ks3 WITH replication = {'class' : 'NetworkTopologyStrategy', 'datacenter2' : 1}", function (err) {
+        var ks = m.keyspaces[name];
+        checkKeyspaceWithInfo(ks, strategy, optionName, optionValue)
+      }
+
+      utils.series([
+        client.connect.bind(client),
+        nonSyncClient.connect.bind(nonSyncClient),
+        function checkKeyspaces(next) {
+          var m = client.metadata;
+          assert.ok(m);
+          assert.ok(m.keyspaces);
+          assert.ok(m.keyspaces['system']);
+          assert.ok(m.keyspaces['system'].strategy);
+          next();
+        },
+        helper.toTask(client.execute, client, "CREATE KEYSPACE ks1 WITH replication = {'class': 'SimpleStrategy', 'replication_factor' : 3}"),
+        helper.toTask(client.execute, client, "CREATE KEYSPACE ks2 WITH replication = {'class': 'SimpleStrategy', 'replication_factor' : 2}"),
+        helper.toTask(client.execute, client, "CREATE KEYSPACE ks3 WITH replication = {'class': 'SimpleStrategy', 'replication_factor' : 1}"),
+        helper.toTask(client.execute, client, "CREATE KEYSPACE ks4 WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1' : 1}"),
+        function checkKeyspaces(next) {
+          checkKeyspace(client, 'ks1', 'org.apache.cassandra.locator.SimpleStrategy', 'replication_factor', '3');
+          checkKeyspace(client, 'ks2', 'org.apache.cassandra.locator.SimpleStrategy', 'replication_factor', '2');
+          checkKeyspace(client, 'ks3', 'org.apache.cassandra.locator.SimpleStrategy', 'replication_factor', '1');
+          checkKeyspace(client, 'ks4', 'org.apache.cassandra.locator.NetworkTopologyStrategy', 'datacenter1', '1');
+
+          // There should be no keyspace metadata for the non sync client until its fetched via refreshKeyspaces.
+          var ks = nonSyncClient.metadata.keyspaces;
+          assert.ok(ks['ks1'] === undefined);
+          assert.ok(ks['ks2'] === undefined);
+          assert.ok(ks['ks3'] === undefined);
+          assert.ok(ks['ks4'] === undefined);
+
+          nonSyncClient.metadata.refreshKeyspaces(function (err) {
             assert.ifError(err);
-            setTimeout(function() {
-              checkKeyspace('ks3', 'org.apache.cassandra.locator.NetworkTopologyStrategy', 'datacenter2', '1');
-              done();
-            }, 2000);
+            checkKeyspace(nonSyncClient, 'ks1', 'org.apache.cassandra.locator.SimpleStrategy', 'replication_factor', '3');
+            checkKeyspace(nonSyncClient, 'ks2', 'org.apache.cassandra.locator.SimpleStrategy', 'replication_factor', '2');
+            checkKeyspace(nonSyncClient, 'ks3', 'org.apache.cassandra.locator.SimpleStrategy', 'replication_factor', '1');
+            checkKeyspace(nonSyncClient, 'ks4', 'org.apache.cassandra.locator.NetworkTopologyStrategy', 'datacenter1', '1');
+            next();
           });
-        });
-      });
+        },
+        helper.toTask(client.execute, client, "ALTER KEYSPACE ks3 WITH replication = {'class' : 'NetworkTopologyStrategy', 'datacenter2' : 1}"),
+        function checkAlteredKeyspace(next) {
+          // rf strategy should have changed on client.
+          checkKeyspace(client, 'ks3', 'org.apache.cassandra.locator.NetworkTopologyStrategy', 'datacenter2', '1');
+
+          // rf strategy should not have changed yet on nonSyncClient without refreshing explicitly.
+          checkKeyspace(nonSyncClient, 'ks3', 'org.apache.cassandra.locator.SimpleStrategy', 'replication_factor', '1');
+
+          nonSyncClient.metadata.refreshKeyspace('ks3', function (err, ks) {
+            assert.ifError(err);
+            checkKeyspaceWithInfo(ks, 'org.apache.cassandra.locator.NetworkTopologyStrategy', 'datacenter2', '1');
+            next();
+          });
+        },
+        client.shutdown.bind(client),
+        nonSyncClient.shutdown.bind(nonSyncClient)
+      ], done);
     });
     it('should delete keyspace information on drop', function (done) {
-      var client = newInstance();
+      var client = newInstance({ refreshSchemaDelay: 50 });
       client.connect(function (err) {
         assert.ifError(err);
         var m = client.metadata;
         assert.ok(m);
-        async.series([
+        assert.ok(!m.keyspaces['ks_todelete']);
+        utils.series([
           helper.toTask(client.execute, client, helper.createKeyspaceCql('ks_todelete', 1)),
-          function checkKeyspaceExists(next) {
-            var ks = m.keyspaces['ks_todelete'];
-            assert.ok(ks);
+          function assertions1(next) {
+            assert.ok(m.keyspaces['ks_todelete']);
             next();
           },
-          helper.toTask(client.execute, client, 'DROP KEYSPACE ks_todelete;'),
-          function (next) {
-            setTimeout(next, 2000);
-          },
-          function checkKeyspaceDropped(next) {
-            var ks = m.keyspaces['ks_todelete'];
-            assert.strictEqual(ks, undefined);
+          helper.toTask(client.execute, client, 'DROP KEYSPACE ks_todelete'),
+          function assertions2(next) {
+            assert.ok(!m.keyspaces['ks_todelete']);
             next();
           }
         ], done);
@@ -84,7 +113,7 @@ describe('Metadata', function () {
       client.connect(function (err) {
         assert.ifError(err);
         var m = client.metadata;
-        async.timesSeries(10, function (n, next) {
+        utils.timesSeries(10, function (n, next) {
           m.getUdt('ks1', 'udt_does_not_exists', function (err, udtInfo) {
             assert.ifError(err);
             assert.strictEqual(udtInfo, null);
@@ -97,9 +126,9 @@ describe('Metadata', function () {
       var client = newInstance();
       var createUdtQuery1 = "CREATE TYPE phone (alias text, number text, country_code int, second_number 'DynamicCompositeType(s => UTF8Type, i => Int32Type)')";
       var createUdtQuery2 = 'CREATE TYPE address (street text, "ZIP" int, phones set<frozen<phone>>)';
-      async.series([
+      utils.series([
         helper.toTask(client.connect, client),
-        helper.toTask(client.execute, client, helper.createKeyspaceCql('ks_udt1', 3)),
+        helper.toTask(client.execute, client, helper.createKeyspaceCql('ks_udt1', 2)),
         helper.toTask(client.execute, client, 'USE ks_udt1'),
         helper.toTask(client.execute, client, createUdtQuery1),
         helper.toTask(client.execute, client, createUdtQuery2),
@@ -148,80 +177,94 @@ describe('Metadata', function () {
       ], done);
     });
     vit('2.1', 'should retrieve the updated metadata after a schema change', function (done) {
-      var client = newInstance();
-      async.series([
+      var client = newInstance({ refreshSchemaDelay: 50 });
+      var nonSyncClient = newInstance({ isMetadataSyncEnabled: false });
+      var clients = [client, nonSyncClient];
+      utils.series([
         client.connect.bind(client),
-        helper.toTask(client.execute, client, helper.createKeyspaceCql('ks_udt_meta', 3)),
+        nonSyncClient.connect.bind(nonSyncClient),
+        helper.toTask(client.execute, client, helper.createKeyspaceCql('ks_udt_meta', 2)),
         helper.toTask(client.execute, client, 'USE ks_udt_meta'),
         helper.toTask(client.execute, client, 'CREATE TYPE type_changing (id uuid, name ascii)'),
         function checkType1(next) {
-          client.metadata.getUdt('ks_udt_meta', 'type_changing', function (err, udt) {
-            assert.ifError(err);
-            assert.ok(udt);
-            assert.strictEqual(udt.fields.length, 2);
-            next();
-          });
+          utils.each(clients, function(client, eachNext) {
+            client.metadata.getUdt('ks_udt_meta', 'type_changing', function (err, udt) {
+              assert.ifError(err);
+              assert.ok(udt);
+              assert.strictEqual(udt.fields.length, 2);
+              eachNext();
+            });
+          }, next);
         },
         helper.toTask(client.execute, client, 'ALTER TYPE type_changing ALTER name TYPE varchar'),
-        function (next) {
-          setTimeout(next, 2000);
-        },
         function checkType2(next) {
-          client.metadata.getUdt('ks_udt_meta', 'type_changing', function (err, udt) {
-            assert.ifError(err);
-            assert.ok(udt);
-            assert.strictEqual(udt.fields.length, 2);
-            assert.strictEqual(udt.fields[1].name, 'name');
-            assert.ok(udt.fields[1].type.code === types.dataTypes.varchar || udt.fields[1].type.code === types.dataTypes.text);
-            next();
-          });
-        }
+          utils.each(clients, function(client, eachNext) {
+            client.metadata.getUdt('ks_udt_meta', 'type_changing', function (err, udt) {
+              assert.ifError(err);
+              assert.ok(udt);
+              assert.strictEqual(udt.fields.length, 2);
+              assert.strictEqual(udt.fields[1].name, 'name');
+              assert.ok(udt.fields[1].type.code === types.dataTypes.varchar || udt.fields[1].type.code === types.dataTypes.text);
+              eachNext();
+            });
+          }, next);
+        },
+        client.shutdown.bind(client),
+        nonSyncClient.shutdown.bind(nonSyncClient)
       ], done);
     });
   });
   describe('#getTrace()', function () {
     it('should retrieve the trace immediately after', function (done) {
       var client = newInstance();
-      async.waterfall([
+      var traceId;
+      utils.series([
         client.connect.bind(client),
         function executeQuery(next) {
-          client.execute(helper.queries.basic, [], { traceQuery: true}, next);
+          client.execute(helper.queries.basic, [], { traceQuery: true}, function (err, result) {
+            assert.ifError(err);
+            traceId = result.info.traceId;
+            next();
+          });
         },
-        function getTrace(result, next) {
-          client.metadata.getTrace(result.info.traceId, next);
-        },
-        function checkTrace(trace, next) {
-          assert.ok(trace);
-          assert.strictEqual(typeof trace.duration, 'number');
-          if (client.controlConnection.protocolVersion >= 4) {
-            //Check the new field added in C* 2.2
-            helper.assertInstanceOf(trace.clientAddress, types.InetAddress);
-          }
-          assert.ok(trace.events.length);
-          next();
+        function getTrace(next) {
+          client.metadata.getTrace(traceId, function (err, trace) {
+            assert.ifError(err);
+            assert.ok(trace);
+            assert.strictEqual(typeof trace.duration, 'number');
+            if (client.controlConnection.protocolVersion >= 4) {
+              //Check the new field added in C* 2.2
+              helper.assertInstanceOf(trace.clientAddress, types.InetAddress);
+            }
+            assert.ok(trace.events.length);
+            next();
+          });
         },
         client.shutdown.bind(client)
       ], done);
     });
     it('should retrieve the trace a few seconds after', function (done) {
       var client = newInstance();
-      async.waterfall([
+      var traceId;
+      utils.series([
         client.connect.bind(client),
         function executeQuery(next) {
-          client.execute('SELECT * FROM system.local', [], { traceQuery: true}, next);
-        },
-        function getTrace(result, next) {
-          client.metadata.getTrace(result.info.traceId, function (err, trace) {
-            setTimeout(function () {
-              next(err, trace);
-            }, 1500);
+          client.execute('SELECT * FROM system.local', [], { traceQuery: true}, function (err, result) {
+            traceId = result.info.traceId;
+            if (err) {
+              return next(err);
+            }
+            setTimeout(next, 1500);
           });
         },
-        function checkTrace(trace, next) {
-          assert.ok(trace);
-          assert.strictEqual(typeof trace.duration, 'number');
-          assert.ok(trace.events.length);
-          next();
+        function getTrace(next) {
+          client.metadata.getTrace(traceId, function (err, trace) {
+            assert.ifError(err);
+            assert.ok(trace);
+            assert.strictEqual(typeof trace.duration, 'number');
+            assert.ok(trace.events.length);
+            next();
+          });
         }
       ], done);
     });
@@ -262,7 +305,9 @@ describe('Metadata', function () {
       }
       if (helper.isCassandraGreaterThan('2.2')) {
         queries.push(
-          'CREATE INDEX map_entries_index ON tbl_indexes1 (entries(map_entries))'
+          'CREATE INDEX map_entries_index ON tbl_indexes1 (entries(map_entries))',
+          'CREATE TABLE ks_tbl_meta.tbl_c22 ' +
+          '(id uuid PRIMARY KEY, smallint_sample smallint, tinyint_sample tinyint, date_sample date, time_sample time)'
         );
       }
       if (is3) {
@@ -272,7 +317,7 @@ describe('Metadata', function () {
           "CREATE INDEX map_all_values_index on tbl_indexes1 (values(map_all))"
         )
       }
-      async.eachSeries(queries, client.execute.bind(client), helper.finish(client, done));
+      utils.eachSeries(queries, client.execute.bind(client), helper.finish(client, done));
     });
     it('should retrieve the metadata of a single partition key table', function (done) {
       var client = newInstance({ keyspace: keyspace});
@@ -437,35 +482,6 @@ describe('Metadata', function () {
         });
       });
     });
-    it('should retrieve the updated metadata after a schema change', function (done) {
-      var client = newInstance();
-      async.series([
-        client.connect.bind(client),
-        helper.toTask(client.execute, client, 'CREATE TABLE ks_tbl_meta.tbl_changing (id uuid PRIMARY KEY, text_sample text)'),
-        function checkTable1(next) {
-          client.metadata.getTable('ks_tbl_meta', 'tbl_changing', function (err, table) {
-            assert.ifError(err);
-            assert.ok(table);
-            assert.strictEqual(table.columns.length, 2);
-            next();
-          });
-        },
-        helper.toTask(client.execute, client, 'ALTER TABLE ks_tbl_meta.tbl_changing ADD new_col1 timeuuid'),
-        function (next) {
-          setTimeout(next, 2000);
-        },
-        function checkTable2(next) {
-          client.metadata.getTable('ks_tbl_meta', 'tbl_changing', function (err, table) {
-            assert.ifError(err);
-            assert.ok(table);
-            assert.strictEqual(table.columns.length, 3);
-            assert.ok(table.columnsByName['new_col1']);
-            assert.strictEqual(table.columnsByName['new_col1'].type.code, types.dataTypes.timeuuid);
-            next();
-          });
-        }
-      ], done);
-    });
     it('should retrieve the metadata of a table with ColumnToCollectionType', function (done) {
       var client = newInstance({ keyspace: keyspace});
       client.connect(function (err) {
@@ -624,14 +640,11 @@ describe('Metadata', function () {
       });
     });
     vit('2.2', 'should retrieve the metadata of a table containing new 2.2 types', function (done) {
-      var client = newInstance();
-      var createTableCql = 'CREATE TABLE ks_tbl_meta.tbl_c22 ' +
-        '(id uuid PRIMARY KEY, smallint_sample smallint, tinyint_sample tinyint, date_sample date, time_sample time)';
-      async.series([
+      var client = newInstance({ keyspace: keyspace });
+      utils.series([
         client.connect.bind(client),
-        helper.toTask(client.execute, client, createTableCql),
         function checkTable(next) {
-          client.metadata.getTable('ks_tbl_meta', 'tbl_c22', function (err, table) {
+          client.metadata.getTable(keyspace, 'tbl_c22', function (err, table) {
             assert.ifError(err);
             assert.ok(table);
             assert.strictEqual(table.columns.length, 5);
@@ -650,7 +663,7 @@ describe('Metadata', function () {
     });
     vit('2.1', 'should retrieve the metadata of a table with udt column', function (done) {
       var client = newInstance();
-      async.series([
+      utils.series([
         client.connect.bind(client),
         function checkMetadata(next) {
           client.metadata.getTable(keyspace, 'tbl_udts1', function (err, table) {
@@ -671,7 +684,7 @@ describe('Metadata', function () {
     });
     vit('2.1', 'should retrieve the metadata of a table with udt partition key', function (done) {
       var client = newInstance();
-      async.series([
+      utils.series([
         client.connect.bind(client),
         function checkMetadata(next) {
           client.metadata.getTable(keyspace, 'tbl_udts2', function (err, table) {
@@ -693,7 +706,7 @@ describe('Metadata', function () {
     });
     it('should retrieve the metadata of a table with custom type columns', function (done) {
       var client = newInstance();
-      async.series([
+      utils.series([
         client.connect.bind(client),
         function checkMetadata(next) {
           client.metadata.getTable(keyspace, 'tbl9', function (err, table) {
@@ -732,7 +745,7 @@ describe('Metadata', function () {
     });
     vit('2.1', 'should retrieve the metadata of a table with quoted udt', function (done) {
       var client = newInstance();
-      async.series([
+      utils.series([
         client.connect.bind(client),
         function checkMetadata(next) {
           client.metadata.getTable(keyspace, 'tbl_udts_with_quoted', function (err, table) {
@@ -751,6 +764,41 @@ describe('Metadata', function () {
         client.shutdown.bind(client)
       ], done);
     });
+    it('should retrieve the updated metadata after a schema change', function (done) {
+      var client = newInstance();
+      var nonSyncClient = newInstance({ isMetadataSyncEnabled: false });
+      var clients = [client, nonSyncClient];
+      utils.series([
+        client.connect.bind(client),
+        nonSyncClient.connect.bind(nonSyncClient),
+        helper.toTask(client.execute, client, 'CREATE TABLE ks_tbl_meta.tbl_changing (id uuid PRIMARY KEY, text_sample text)'),
+        function checkTable1(next) {
+          utils.each(clients, function(client, eachNext) {
+            client.metadata.getTable('ks_tbl_meta', 'tbl_changing', function (err, table) {
+              assert.ifError(err);
+              assert.ok(table);
+              assert.strictEqual(table.columns.length, 2);
+              eachNext();
+            });
+          }, next);
+        },
+        helper.toTask(client.execute, client, 'ALTER TABLE ks_tbl_meta.tbl_changing ADD new_col1 timeuuid'),
+        function checkTable2(next) {
+          utils.each(clients, function(clien, eachNext) {
+            client.metadata.getTable('ks_tbl_meta', 'tbl_changing', function (err, table) {
+              assert.ifError(err);
+              assert.ok(table);
+              assert.strictEqual(table.columns.length, 3);
+              assert.ok(table.columnsByName['new_col1']);
+              assert.strictEqual(table.columnsByName['new_col1'].type.code, types.dataTypes.timeuuid);
+              eachNext();
+            });
+          }, next);
+        },
+        client.shutdown.bind(nonSyncClient),
+        nonSyncClient.shutdown.bind(nonSyncClient)
+      ], done);
+    });
   });
   vdescribe('3.0', '#getMaterializedView()', function () {
     var keyspace = 'ks_view_meta';
@@ -761,17 +809,17 @@ describe('Metadata', function () {
         "CREATE TABLE ks_view_meta.scores (user TEXT, game TEXT, year INT, month INT, day INT, score INT, PRIMARY KEY (user, game, year, month, day))",
         "CREATE MATERIALIZED VIEW ks_view_meta.dailyhigh AS SELECT user FROM scores WHERE game IS NOT NULL AND year IS NOT NULL AND month IS NOT NULL AND day IS NOT NULL AND score IS NOT NULL AND user IS NOT NULL PRIMARY KEY ((game, year, month, day), score, user) WITH CLUSTERING ORDER BY (score DESC)"
       ];
-      async.eachSeries(queries, client.execute.bind(client), function (err) {
+      utils.eachSeries(queries, client.execute.bind(client), function (err) {
         client.shutdown();
         if (err) {
           return done(err);
         }
-        setTimeout(done, 2000);
+        done();
       });
     });
     it('should retrieve the view and table metadata', function (done) {
       var client = newInstance();
-      async.series([
+      utils.series([
         client.connect.bind(client),
         function checkMeta(next) {
           client.metadata.getMaterializedView(keyspace, 'dailyhigh', function (err, view) {
@@ -793,52 +841,70 @@ describe('Metadata', function () {
       ], done);
     });
     it('should refresh the view metadata via events', function (done) {
-      var client = newInstance({ keyspace: 'ks_view_meta' });
-      async.series([
+      var client = newInstance({ keyspace: 'ks_view_meta', refreshSchemaDelay: 50 });
+      var nonSyncClient = newInstance({ keyspace: 'ks_view_meta', isMetadataSyncEnabled: false });
+      var clients = [client, nonSyncClient];
+      utils.series([
         client.connect.bind(client),
-        helper.toTask(client.execute, client, 'CREATE MATERIALIZED VIEW monthlyhigh AS SELECT user FROM scores WHERE game IS NOT NULL AND year IS NOT NULL AND month IS NOT NULL AND score IS NOT NULL AND user IS NOT NULL AND day IS NOT NULL PRIMARY KEY ((game, year, month), score, user, day) WITH CLUSTERING ORDER BY (score DESC) AND compaction = { \'class\' : \'SizeTieredCompactionStrategy\' }'),
+        nonSyncClient.connect.bind(nonSyncClient),
+        helper.toTask(client.execute, client, 'CREATE MATERIALIZED VIEW monthlyhigh AS ' +
+          'SELECT user FROM scores WHERE game IS NOT NULL AND year IS NOT NULL AND month IS NOT NULL AND' +
+          ' score IS NOT NULL AND user IS NOT NULL AND day IS NOT NULL' +
+          ' PRIMARY KEY ((game, year, month), score, user, day)' +
+          ' WITH CLUSTERING ORDER BY (score DESC) AND compaction = { \'class\' : \'SizeTieredCompactionStrategy\' }'),
         function checkView1(next) {
-          client.metadata.getMaterializedView('ks_view_meta', 'monthlyhigh', function (err, view) {
-            assert.ifError(err);
-            assert.ok(view);
-            assert.strictEqual(view.partitionKeys.length, 3);
-            assert.strictEqual(view.partitionKeys.map(function (x) { return x.name;}).join(', '), 'game, year, month');
-            assert.strictEqual(view.clusteringKeys.map(function (x) { return x.name;}).join(', '), 'score, user, day');
-            helper.assertContains(view.compactionClass, 'SizeTieredCompactionStrategy');
-            next();
-          });
+          utils.each(clients, function(client, eachNext) {
+            client.metadata.getMaterializedView('ks_view_meta', 'monthlyhigh', function (err, view) {
+              assert.ifError(err);
+              assert.ok(view);
+              assert.strictEqual(view.partitionKeys.length, 3);
+              assert.strictEqual(view.partitionKeys.map(function (x) { return x.name;}).join(', '), 'game, year, month');
+              assert.strictEqual(view.clusteringKeys.map(function (x) { return x.name;}).join(', '), 'score, user, day');
+              helper.assertContains(view.compactionClass, 'SizeTieredCompactionStrategy');
+              eachNext();
+            });
+          }, next);
         },
-        helper.toTask(client.execute, client, 'ALTER MATERIALIZED VIEW monthlyhigh WITH compaction = { \'class\' : \'LeveledCompactionStrategy\' }'),
+        helper.toTask(client.execute, client, 'ALTER MATERIALIZED VIEW monthlyhigh' +
+          ' WITH compaction = { \'class\' : \'LeveledCompactionStrategy\' }'),
         function checkView1(next) {
-          client.metadata.getMaterializedView('ks_view_meta', 'monthlyhigh', function (err, view) {
-            assert.ifError(err);
-            assert.ok(view);
-            assert.strictEqual(view.partitionKeys.length, 3);
-            assert.strictEqual(view.clusteringKeys.length, 3);
-            helper.assertContains(view.compactionClass, 'LeveledCompactionStrategy');
-            next();
-          });
+          utils.each(clients, function(client, eachNext) {
+            client.metadata.getMaterializedView('ks_view_meta', 'monthlyhigh', function (err, view) {
+              assert.ifError(err);
+              assert.ok(view);
+              assert.strictEqual(view.partitionKeys.length, 3);
+              assert.strictEqual(view.clusteringKeys.length, 3);
+              helper.assertContains(view.compactionClass, 'LeveledCompactionStrategy');
+              eachNext();
+            });
+          }, next);
         },
         helper.toTask(client.execute, client, 'DROP MATERIALIZED VIEW monthlyhigh'),
         function checkDropped(next) {
-          client.metadata.getMaterializedView('ks_view_meta', 'monthlyhigh', function (err, view) {
-            assert.ifError(err);
-            assert.strictEqual(view, null);
-            next();
-          });
+          utils.each(clients, function(client, eachNext) {
+            client.metadata.getMaterializedView('ks_view_meta', 'monthlyhigh', function (err, view) {
+              assert.ifError(err);
+              assert.strictEqual(view, null);
+              eachNext();
+            });
+          }, next)
         },
-        client.shutdown.bind(client)
+        client.shutdown.bind(client),
+        nonSyncClient.shutdown.bind(nonSyncClient)
       ], done);
     });
     it('should refresh the view metadata as result of table change via events', function (done) {
-      var client = newInstance({ keyspace: 'ks_view_meta' });
-      async.series([
+      var client = newInstance({ keyspace: 'ks_view_meta', refreshSchemaDelay: 50 });
+      utils.series([
         client.connect.bind(client),
         helper.toTask(client.execute, client, 'CREATE TABLE users (user TEXT PRIMARY KEY, first_name TEXT)'),
         // create a view using 'select *'.
-        helper.toTask(client.execute, client, 'CREATE MATERIALIZED VIEW users_by_first_all AS SELECT * FROM users WHERE user IS NOT NULL AND first_name IS NOT NULL PRIMARY KEY (first_name, user)'),
+        helper.toTask(client.execute, client, 'CREATE MATERIALIZED VIEW users_by_first_all AS SELECT * FROM users' +
+          ' WHERE user IS NOT NULL AND first_name IS NOT NULL PRIMARY KEY (first_name, user)'),
         // create same view using 'select <columns>'.
-        helper.toTask(client.execute, client, 'CREATE MATERIALIZED VIEW users_by_first AS SELECT user, first_name FROM users WHERE user IS NOT NULL AND first_name IS NOT NULL PRIMARY KEY (first_name, user)'),
+        helper.toTask(client.execute, client, 'CREATE MATERIALIZED VIEW users_by_first AS' +
+          ' SELECT user, first_name FROM users WHERE user IS NOT NULL AND first_name IS NOT NULL' +
+          ' PRIMARY KEY (first_name, user)'),
         function checkAllView(next) {
           client.metadata.getMaterializedView('ks_view_meta', 'users_by_first_all', function (err, view) {
             assert.ifError(err);

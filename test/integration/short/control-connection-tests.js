@@ -1,12 +1,15 @@
+"use strict";
 var assert = require('assert');
-var async = require('async');
+var util = require('util');
 
 var helper = require('../../test-helper');
+var Client = require('../../../lib/client.js');
 var ControlConnection = require('../../../lib/control-connection');
 var utils = require('../../../lib/utils');
 var types = require('../../../lib/types');
 var clientOptions = require('../../../lib/client-options');
 var policies = require('../../../lib/policies');
+var ProfileManager = require('../../../lib/execution-profile').ProfileManager;
 
 describe('ControlConnection', function () {
   this.timeout(120000);
@@ -28,12 +31,16 @@ describe('ControlConnection', function () {
       });
     });
     it('should subscribe to SCHEMA_CHANGE events and refresh keyspace information', function (done) {
-      var cc = newInstance();
-      async.series([
+      var cc = newInstance({ refreshSchemaDelay: 100 });
+      var otherClient = new Client(helper.baseOptions);
+      utils.series([
         cc.init.bind(cc),
-        function createKeyspace(next) {
-          var query = "CREATE KEYSPACE sample_change_1 WITH replication = {'class': 'SimpleStrategy', 'replication_factor' : 3}";
-          helper.ccmHelper.exec(['node1', 'cqlsh', '--exec', query], helper.wait(500, next));
+        helper.toTask(otherClient.execute, otherClient, "CREATE KEYSPACE sample_change_1 WITH replication = " +
+          "{'class': 'SimpleStrategy', 'replication_factor' : 3}"),
+        function (next) {
+          helper.setIntervalUntil(function () {
+            return cc.metadata.keyspaces['sample_change_1'];
+          }, 200, 10, next);
         },
         function (next) {
           var keyspaceInfo = cc.metadata.keyspaces['sample_change_1'];
@@ -43,9 +50,12 @@ describe('ControlConnection', function () {
           assert.ok(keyspaceInfo.strategy.indexOf('SimpleStrategy') > 0);
           next();
         },
-        function alterKeyspace(next) {
-          var query = "ALTER KEYSPACE sample_change_1 WITH replication = {'class': 'SimpleStrategy', 'replication_factor' : 2}";
-          helper.ccmHelper.exec(['node1', 'cqlsh', '--exec', query], helper.wait(500, next));
+        helper.toTask(otherClient.execute, otherClient, "ALTER KEYSPACE sample_change_1 WITH replication = " +
+          "{'class': 'SimpleStrategy', 'replication_factor' : 2}"),
+        function (next) {
+          helper.setIntervalUntil(function () {
+            return cc.metadata.keyspaces['sample_change_1'].strategyOptions.replication_factor == 2;
+          }, 200, 10, next);
         },
         function (next) {
           var keyspaceInfo = cc.metadata.keyspaces['sample_change_1'];
@@ -53,20 +63,34 @@ describe('ControlConnection', function () {
           assert.equal(keyspaceInfo.strategyOptions.replication_factor, 2);
           next();
         },
-        function alterKeyspace(next) {
-          var query = "DROP keyspace sample_change_1";
-          helper.ccmHelper.exec(['node1', 'cqlsh', '--exec', query], helper.wait(500, next));
+        helper.toTask(otherClient.execute, otherClient, "DROP keyspace sample_change_1"),
+        function (next) {
+          helper.setIntervalUntil(function () {
+            return !cc.metadata.keyspaces['sample_change_1'];
+          }, 200, 10, next);
         },
         function (next) {
           var keyspaceInfo = cc.metadata.keyspaces['sample_change_1'];
           assert.ok(!keyspaceInfo);
           next();
-        }
+        },
+        function ccShutDown(next) {
+          cc.shutdown();
+          next();
+        },
+        otherClient.shutdown.bind(otherClient)
       ], done);
     });
     it('should subscribe to STATUS_CHANGE events', function (done) {
-      var cc = newInstance();
-      async.series([
+      // Only ignored hosts are marked as DOWN when receiving the event
+      // Use an specific load balancing policy, to set the node2 as ignored
+      function TestLoadBalancing() {}
+      util.inherits(TestLoadBalancing, policies.loadBalancing.RoundRobinPolicy);
+      TestLoadBalancing.prototype.getDistance = function (h) {
+        return (helper.lastOctetOf(h) === '2' ? types.distance.ignored : types.distance.local);
+      };
+      var cc = newInstance({ policies: { loadBalancing: new TestLoadBalancing() } });
+      utils.series([
         cc.init.bind(cc),
         function (next) {
           //wait for all initial events
@@ -86,18 +110,16 @@ describe('ControlConnection', function () {
             return value;
           }, 0);
           assert.strictEqual(countUp, 1);
+          cc.shutdown();
           next();
         }
       ], done);
     });
     it('should subscribe to TOPOLOGY_CHANGE add events and refresh ring info', function (done) {
       var options = clientOptions.extend(utils.extend({ pooling: { coreConnectionsPerHost: {}}}, helper.baseOptions));
-      options.pooling.heartBeatInterval = 0;
-      options.pooling.coreConnectionsPerHost[types.distance.local] = 1;
-      options.pooling.coreConnectionsPerHost[types.distance.remote] = 1;
       options.policies.reconnection = new policies.reconnection.ConstantReconnectionPolicy(1000);
-      var cc = new ControlConnection(options);
-      async.series([
+      var cc = newInstance(options, 1, 1);
+      utils.series([
         cc.init.bind(cc),
         function (next) {
           //add a node
@@ -130,7 +152,7 @@ describe('ControlConnection', function () {
     });
     it('should subscribe to TOPOLOGY_CHANGE remove events and refresh ring info', function (done) {
       var cc = newInstance();
-      async.series([
+      utils.series([
         cc.init.bind(cc),
         function (next) {
           //decommission node
@@ -145,40 +167,60 @@ describe('ControlConnection', function () {
     });
     it('should reconnect when host used goes down', function (done) {
       var cc = newInstance();
-      cc.init(function () {
-        //initialize the load balancing policy
-        cc.options.policies.loadBalancing.init(null, cc.hosts, function () {});
-        //it should be using the first node: kill it
-        helper.ccmHelper.exec(['node1', 'stop'], function (err) {
-          if (err) return done(err);
-          //A little help here
-          cc.hosts.slice(0)[0].setDown();
-          setTimeout(function () {
-            var hosts = cc.hosts.slice(0);
-            assert.strictEqual(hosts.length, 2);
-            var countUp = hosts.reduce(function (value, host) {
-              value += host.isUp() ? 1 : 0;
-              return value;
-            }, 0);
-            assert.strictEqual(countUp, 1);
-            done();
-          }, 3000);
-        });
-      });
+      var host1;
+      utils.series([
+        cc.init.bind(cc),
+        function initLbp(next) {
+          cc.options.policies.loadBalancing.init(null, cc.hosts, next);
+        },
+        function ensureConnected(next) {
+          // there should be a single connection to the first host
+          var hosts = cc.hosts.values();
+          assert.strictEqual(hosts.length, 2);
+          assert.strictEqual(hosts[0].pool.connections.length, 1);
+          assert.strictEqual(hosts[1].pool.connections.length, 0);
+          host1 = hosts[0];
+          next();
+        },
+        helper.toTask(helper.ccmHelper.exec, null, ['node1', 'stop']),
+        function ensureDown(next) {
+          // connections to host1 could be down or not
+          if (host1.pool.connections.length === 0) {
+            return next();
+          }
+          // close the connection
+          host1.setDown();
+          setTimeout(next, 5000);
+        },
+        function assertions(next) {
+          var hosts = cc.hosts.values();
+          assert.strictEqual(hosts.length, 2);
+          var countUp = hosts.reduce(function (value, host) {
+            value += host.isUp() ? 1 : 0;
+            return value;
+          }, 0);
+          assert.strictEqual(countUp, 1);
+          assert.strictEqual(host1.isUp(), false);
+          next();
+        }
+      ], done);
     });
     it('should reconnect when all hosts go down and back up', function (done) {
       var options = clientOptions.extend(utils.extend({ pooling: { coreConnectionsPerHost: {}}}, helper.baseOptions));
-      options.pooling.heartBeatInterval = 0;
-      options.pooling.coreConnectionsPerHost[types.distance.local] = 1;
-      options.pooling.coreConnectionsPerHost[types.distance.remote] = 1;
       options.policies.reconnection = new policies.reconnection.ConstantReconnectionPolicy(1000);
-      var cc = new ControlConnection(options);
-      async.series([
+      var cc = newInstance(options, 1, 1);
+      utils.series([
         cc.init.bind(cc),
         function initLbp(next) {
           assert.ok(cc.host);
           assert.strictEqual(helper.lastOctetOf(cc.host), '1');
           cc.options.policies.loadBalancing.init(null, cc.hosts, next);
+        },
+        function setHostDistance(next) {
+          // the control connection host should be local or remote to trigger DOWN events
+          var distance = options.policies.loadBalancing.getDistance(cc.host);
+          cc.host.setDistance(distance);
+          next();
         },
         function stop1(next) {
           helper.ccmHelper.stopNode(1, next);
@@ -189,7 +231,9 @@ describe('ControlConnection', function () {
         function setDownManually(next) {
           //help in case the event didn't fired by socket disconnection
           cc.hosts.forEach(function (h) {
-            h.setDown();
+            if (h.pool.connections.length === 1) {
+              h.removeFromPool(h.pool.connections[0]);
+            }
           });
           assert.strictEqual(cc.host, null);
           next();
@@ -236,11 +280,11 @@ describe('ControlConnection', function () {
 });
 
 /** @returns {ControlConnection} */
-function newInstance() {
-  var options = clientOptions.extend(utils.extend({ pooling: { coreConnectionsPerHost: {}}}, helper.baseOptions));
+function newInstance(options, localConnections, remoteConnections) {
+  options = clientOptions.extend(utils.extend({ pooling: { coreConnectionsPerHost: {}}}, helper.baseOptions, options));
   //disable the heartbeat
   options.pooling.heartBeatInterval = 0;
-  options.pooling.coreConnectionsPerHost[types.distance.local] = 2;
-  options.pooling.coreConnectionsPerHost[types.distance.remote] = 1;
-  return new ControlConnection(options);
+  options.pooling.coreConnectionsPerHost[types.distance.local] = localConnections || 2;
+  options.pooling.coreConnectionsPerHost[types.distance.remote] = remoteConnections || 1;
+  return new ControlConnection(options, new ProfileManager(options));
 }

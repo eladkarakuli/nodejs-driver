@@ -1,15 +1,14 @@
 "use strict";
 var assert = require('assert');
-var async = require('async');
 var util = require('util');
+var events = require('events');
+var rewire = require('rewire');
 
 var helper = require('../test-helper.js');
-var Client = require('../../lib/client.js');
 var clientOptions = require('../../lib/client-options.js');
 var Host = require('../../lib/host.js').Host;
 var Metadata = require('../../lib/metadata');
 var TableMetadata = require('../../lib/metadata/table-metadata');
-var MaterializedView = require('../../lib/metadata/materialized-view');
 var tokenizer = require('../../lib/tokenizer');
 var types = require('../../lib/types');
 var dataTypes = types.dataTypes;
@@ -30,6 +29,7 @@ describe('Metadata', function () {
           }]});
         }
       };
+      //noinspection JSCheckFunctionSignatures
       var metadata = new Metadata(clientOptions.defaultOptions(), cc);
       metadata.tokenizer = new tokenizer.Murmur3Tokenizer();
       metadata.ring = [0, 1, 2, 3, 4, 5];
@@ -165,51 +165,266 @@ describe('Metadata', function () {
       assert.strictEqual(replicas[1], '0');
       assert.strictEqual(replicas[2], '1');
     });
-    it('should return depending on the dc rf with network topology', function () {
-      var cc = {
-        query: function (q, cb) {
-          cb(null, {rows: [{
-            'keyspace_name': 'dummy',
-            'strategy_class': 'NetworkTopologyStrategy',
-            'strategy_options': '{"dc1": "3", "dc2": "1"}'
-          }]});
-        }
-      };
+    it('should return depending on the dc rf with network topology', function (done) {
+      var cc = getControlConnectionForRows([{
+        'keyspace_name': 'dummy',
+        'strategy_class': 'NetworkTopologyStrategy',
+        'strategy_options': '{"dc1": "3", "dc2": "1"}'
+      }]);
       var options = clientOptions.extend({}, helper.baseOptions);
       var metadata = new Metadata(options, cc);
-      metadata.tokenizer = new tokenizer.Murmur3Tokenizer();
-      //Use the value as token
-      metadata.tokenizer.hash = function (b) { return b[0]};
-      metadata.tokenizer.compare = function (a, b) {if (a > b) return 1; if (a < b) return -1; return 0};
-      metadata.datacenters = {'dc1': 4, 'dc2': 4};
+      metadata.tokenizer = getTokenizer();
+      var racks = new utils.HashSet();
+      racks.add('rack1');
+      metadata.datacenters = {
+        'dc1': { hostLength: 4, racks: racks },
+        'dc2': { hostLength: 4, racks: racks }};
       metadata.ring = [0, 1, 2, 3, 4, 5, 6, 7];
-      //load even primary replicas
+      //load primary replicas
       metadata.primaryReplicas = {};
       for (var i = 0; i < metadata.ring.length; i ++) {
         var h = new Host(i.toString(), 2, options);
         h.datacenter = 'dc' + ((i % 2) + 1);
+        h.rack = 'rack1';
         metadata.primaryReplicas[i.toString()] = h;
       }
       metadata.log = helper.noop;
-      metadata.refreshKeyspaces();
-      var replicas = metadata.getReplicas('dummy', new Buffer([0]));
-      assert.ok(replicas);
-      //3 replicas from dc1 and 1 replica from dc2
-      assert.strictEqual(replicas.length, 4);
-      assert.strictEqual(replicas[0].address, '0');
-      assert.strictEqual(replicas[1].address, '1');
-      assert.strictEqual(replicas[2].address, '2');
-      assert.strictEqual(replicas[3].address, '4');
+      metadata.refreshKeyspaces(function () {
+        var replicas = metadata.getReplicas('dummy', new Buffer([0]));
+        assert.ok(replicas);
+        //3 replicas from dc1 and 1 replica from dc2
+        assert.strictEqual(replicas.length, 4);
+        assert.strictEqual(replicas[0].address, '0');
+        assert.strictEqual(replicas[1].address, '1');
+        assert.strictEqual(replicas[2].address, '2');
+        assert.strictEqual(replicas[3].address, '4');
+        done();
+      });
+    });
+    it('should return depending on the dc rf and rack with network topology', function (done) {
+      var cc = getControlConnectionForRows([{
+        'keyspace_name': 'dummy',
+        'strategy_class': 'NetworkTopologyStrategy',
+        'strategy_options': '{"dc1": "3", "dc2": "3", "non_existent_dc": "1"}'
+      }]);
+      var options = clientOptions.extend({}, helper.baseOptions);
+      var metadata = new Metadata(options, cc);
+      metadata.tokenizer = getTokenizer();
+      var racksDc1 = new utils.HashSet();
+      racksDc1.add('dc1_r1');
+      racksDc1.add('dc1_r2');
+      var racksDc2 = new utils.HashSet();
+      racksDc2.add('dc2_r1');
+      racksDc2.add('dc2_r2');
+      metadata.datacenters = {
+        'dc1': { hostLength: 4, racks: racksDc1 },
+        'dc2': { hostLength: 4, racks: racksDc2 }};
+      metadata.ring = [0, 1, 2, 3, 4, 5, 6, 7];
+      //load primary replicas
+      metadata.primaryReplicas = {};
+      for (var i = 0; i < metadata.ring.length; i ++) {
+        // Hosts with in alternate dc and alternate rack
+        var h = new Host(i.toString(), 2, options);
+        h.datacenter = 'dc' + ((i % 2) + 1);
+        h.rack = h.datacenter + '_r' + ((i % 4) <= 1 ? 1 : 2);
+        metadata.primaryReplicas[i.toString()] = h;
+      }
+      metadata.log = helper.noop;
+      metadata.refreshKeyspaces(function () {
+        var replicas = metadata.getReplicas('dummy', new Buffer([0]));
+        assert.ok(replicas);
+        assert.deepEqual(replicas.map(getAddress), [ '0', '1', '2', '3', '4', '5' ]);
+        replicas = metadata.getReplicas('dummy', new Buffer([1]));
+        assert.ok(replicas);
+        assert.deepEqual(replicas.map(getAddress), [ '1', '2', '3', '4', '5', '6' ]);
+        replicas = metadata.getReplicas('dummy', new Buffer([3]));
+        assert.ok(replicas);
+        assert.deepEqual(replicas.map(getAddress), [ '3', '4', '5', '6', '7', '0' ]);
+        done();
+      });
+    });
+    it('should return depending on the dc rf and rack with network topology and skipping hosts', function (done) {
+      var cc = getControlConnectionForRows([{
+        'keyspace_name': 'dummy',
+        'strategy_class': 'NetworkTopologyStrategy',
+        'strategy_options': '{"dc1": "3", "dc2": "2"}'
+      }]);
+      var options = clientOptions.extend({}, helper.baseOptions);
+      var metadata = new Metadata(options, cc);
+      metadata.tokenizer = getTokenizer();
+      var racksDc1 = new utils.HashSet();
+      racksDc1.add('dc1_r1');
+      racksDc1.add('dc1_r2');
+      var racksDc2 = new utils.HashSet();
+      racksDc2.add('dc2_r1');
+      racksDc2.add('dc2_r2');
+      metadata.datacenters = {
+        'dc1': { hostLength: 4, racks: racksDc1 },
+        'dc2': { hostLength: 4, racks: racksDc2 }};
+      metadata.ring = [0, 1, 2, 3, 4, 5, 6, 7];
+      //load primary replicas
+      metadata.primaryReplicas = {};
+      for (var i = 0; i < metadata.ring.length; i ++) {
+        // Hosts with in alternate dc and alternate rack
+        var h = new Host(i.toString(), 2, options);
+        h.datacenter = 'dc' + ((i % 2) + 1);
+        h.rack = h.datacenter + '_r' + ((i % 4) <= 1 ? 1 : 2);
+        metadata.primaryReplicas[i.toString()] = h;
+      }
+      //reorganize racks in dc1 to set contiguous tokens in the same rack
+      metadata.primaryReplicas['0'].rack = 'dc1_rack1';
+      metadata.primaryReplicas['2'].rack = 'dc1_rack1';
+      metadata.primaryReplicas['4'].rack = 'dc1_rack2';
+      metadata.primaryReplicas['6'].rack = 'dc1_rack2';
+      metadata.log = helper.noop;
+      metadata.refreshKeyspaces(function () {
+        var replicas = metadata.getReplicas('dummy', new Buffer([0]));
+        assert.ok(replicas);
+        // For DC1, it should skip the replica with the same rack (node2) and add it at the end: 0, 4, 2
+        assert.deepEqual(replicas.map(getAddress), [ '0', '1', '3', '4', '2' ]);
+        done();
+      });
+    });
+    it('should return quickly with many replicas and 0 nodes in one DC.', function (done) {
+      this.timeout(2000);
+      var cc = getControlConnectionForRows([{
+        'keyspace_name': 'dummy',
+        'strategy_class': 'NetworkTopologyStrategy',
+        'strategy_options': '{"dc1": "3", "dc2": "2"}'
+      }]);
+      var options = clientOptions.extend({}, helper.baseOptions);
+      var metadata = new Metadata(options, cc);
+      metadata.tokenizer = getTokenizer();
+      var racksDc1 = new utils.HashSet();
+      racksDc1.add('dc1_r1');
+      var racksDc2 = new utils.HashSet();
+      racksDc2.add('dc2_r1');
+      metadata.datacenters = {
+        'dc1': {hostLength: 100, racks: racksDc1},
+        'dc2': {hostLength: 0, racks: racksDc2}
+      };
+
+      metadata.ring = [];
+      // create ring with 100 replicas and 256 vnodes each.  place every replica in DC1.
+      metadata.primaryReplicas = {};
+      for (var r = 0; r < 100; r++) {
+        var h = new Host(r.toString(), 2, options);
+        h.datacenter = 'dc1';
+        h.rack = 'dc1_r1';
+        // 256 vnodes per replica.
+        for (var v = 0; v < 256; v++) {
+          var token = (v * 256) + r;
+          metadata.ring.push(token);
+          metadata.primaryReplicas[token.toString()] = h;
+        }
+      }
+      metadata.ring.sort(function (a, b) {
+        return a - b
+      });
+
+      metadata.log = helper.noop;
+      // Get the replicas of 5.  Since DC2 has 0 replicas, we only expect 3 replicas (the number of DC1).
+      metadata.refreshKeyspaces(function () {
+        var replicas = metadata.getReplicas('dummy', new Buffer([5]));
+        assert.ok(replicas);
+        assert.deepEqual(replicas.map(getAddress), ['5', '6', '7']);
+        done();
+      });
+    });
+    it('should return quickly with many replicas and not enough nodes in a DC to satisfy RF.', function (done) {
+      this.timeout(2000);
+      var cc = getControlConnectionForRows([{
+        'keyspace_name': 'dummy',
+        'strategy_class': 'NetworkTopologyStrategy',
+        'strategy_options': '{"dc1": "3", "dc2": "2"}'
+      }]);
+      var options = clientOptions.extend({}, helper.baseOptions);
+      var metadata = new Metadata(options, cc);
+      metadata.tokenizer = getTokenizer();
+      var racksDc1 = new utils.HashSet();
+      racksDc1.add('dc1_r1');
+      var racksDc2 = new utils.HashSet();
+      racksDc2.add('dc2_r1');
+      metadata.datacenters = {
+        'dc1': {hostLength: 100, racks: racksDc1},
+        'dc2': {hostLength: 1, racks: racksDc2}
+      };
+
+      metadata.ring = [];
+      // create ring with 100 replicas and 256 vnodes each.  place every replica in DC1 except replica 0.
+      metadata.primaryReplicas = {};
+      for (var r = 0; r < 100; r++) {
+        var h = new Host(r.toString(), 2, options);
+        h.datacenter = 'dc1';
+        h.rack = 'dc1_r1';
+        // Place replica 0 in DC2.
+        if (r == 0) {
+          h.datacenter = 'dc2';
+          h.rack = 'dc2_r1';
+        }
+        // 256 vnodes per replica.
+        for (var v = 0; v < 256; v++) {
+          var token = (v * 256) + r;
+          metadata.ring.push(token);
+          metadata.primaryReplicas[token.toString()] = h;
+        }
+      }
+      // sort the ring so the tokens are in order (this is done in metadata buildTokens, but it accounts for
+      // partitioner which we don't need to use here).
+      metadata.ring.sort(function (a, b) {
+        return a - b
+      });
+
+      metadata.log = helper.noop;
+      // Get the replicas of 0.  Since token 0 is a replica in DC2 and DC2 only has 1, it should return 1 replica
+      // in addition to the next 3 replicas from DC1.
+      metadata.refreshKeyspaces(function () {
+        var replicas = metadata.getReplicas('dummy', new Buffer([0]));
+        assert.ok(replicas);
+        assert.deepEqual(replicas.map(getAddress), ['0', '1', '2', '3']);
+        // Get the replicas for token 51752 which should resolve to primary replica 40 (202nd vnode, 212 * 256 + 40),
+        // its next two subsequent replicas for DC1, and then 0 for DC2 since it only has that one replica.
+        replicas = metadata.getReplicas('dummy', new Buffer([51752]));
+        assert.ok(replicas);
+        assert.deepEqual(replicas.map(getAddress), ['40', '41', '42', '0']);
+        done();
+      });
     });
   });
   describe('#clearPrepared()', function () {
     it('should clear the internal state', function () {
-      var metadata = new Metadata(clientOptions.defaultOptions());
-      metadata.getPreparedInfo('QUERY1');
-      metadata.getPreparedInfo('QUERY2');
+      var metadata = new Metadata(clientOptions.defaultOptions(), null);
+      metadata.getPreparedInfo(null, 'QUERY1');
+      metadata.getPreparedInfo(null, 'QUERY2');
       assert.strictEqual(metadata.preparedQueries['__length'], 2);
       metadata.clearPrepared();
       assert.strictEqual(metadata.preparedQueries['__length'], 0);
+    });
+  });
+  describe('#getPreparedInfo()', function () {
+    it('should create a new EventEmitter when the query has not been prepared', function () {
+      var metadata = new Metadata(clientOptions.defaultOptions(), null);
+      var info = metadata.getPreparedInfo(null, 'query1');
+      helper.assertInstanceOf(info, events.EventEmitter);
+      info = metadata.getPreparedInfo(null, 'query2');
+      helper.assertInstanceOf(info, events.EventEmitter);
+    });
+    it('should get the same EventEmitter when the query is the same', function () {
+      var metadata = new Metadata(clientOptions.defaultOptions(), null);
+      var info1 = metadata.getPreparedInfo(null, 'query1');
+      helper.assertInstanceOf(info1, events.EventEmitter);
+      var info2 = metadata.getPreparedInfo(null, 'query1');
+      helper.assertInstanceOf(info2, events.EventEmitter);
+      assert.strictEqual(info1, info2);
+    });
+    it('should create a new EventEmitter when the query is the same but the keyspace is different', function () {
+      var metadata = new Metadata(clientOptions.defaultOptions(), null);
+      var info0 = metadata.getPreparedInfo(null, 'query1');
+      var info1 = metadata.getPreparedInfo('ks1', 'query1');
+      var info2 = metadata.getPreparedInfo('ks2', 'query1');
+      assert.notStrictEqual(info0, info1);
+      assert.notStrictEqual(info0, info2);
+      assert.notStrictEqual(info1, info2);
     });
   });
   describe('#getUdt()', function () {
@@ -317,7 +532,7 @@ describe('Metadata', function () {
       //no keyspace named ks1 in metadata
       metadata.keyspaces = { ks1: { udts: {}}};
       //Invoke multiple times in parallel
-      async.times(50, function (n, next) {
+      utils.times(50, function (n, next) {
         metadata.getUdt('ks1', 'udt5', function (err, udtInfo) {
           if (err) return next(err);
           assert.ok(udtInfo);
@@ -350,7 +565,7 @@ describe('Metadata', function () {
       //no keyspace named ks1 in metadata
       metadata.keyspaces = { ks1: { udts: {}}};
       //Invoke multiple times in parallel
-      async.timesSeries(50, function (n, next) {
+      utils.timesSeries(50, function (n, next) {
         metadata.getUdt('ks1', 'udt10', function (err, udtInfo) {
           if (err) return next(err);
           assert.ok(udtInfo);
@@ -376,7 +591,7 @@ describe('Metadata', function () {
       };
       var metadata = new Metadata(clientOptions.defaultOptions(), cc);
       metadata.keyspaces = { ks1: { udts: {}}};
-      async.timesSeries(20, function (n, next) {
+      utils.timesSeries(20, function (n, next) {
         metadata.getUdt('ks1', 'udt20', function (err, udtInfo) {
           if (err) return next(err);
           assert.strictEqual(udtInfo, null);
@@ -625,7 +840,7 @@ describe('Metadata', function () {
       };
       var metadata = new Metadata(clientOptions.defaultOptions(), cc);
       metadata.keyspaces = { ks_tbl_meta: { tables: {}}};
-      async.times(100, function (n, next) {
+      utils.map(new Array(100), function (n, next) {
         metadata.getTable('ks_tbl_meta', 'tbl1', next);
       }, function (err, results) {
         assert.ifError(err);
@@ -665,7 +880,7 @@ describe('Metadata', function () {
       };
       var metadata = new Metadata(clientOptions.defaultOptions(), cc);
       metadata.keyspaces = { ks_tbl_meta: { tables: {}}};
-      async.timesSeries(100, function (n, next) {
+      utils.mapSeries(new Array(100), function (n, next) {
         metadata.getTable('ks_tbl_meta', 'tbl1', next);
       }, function (err, results) {
         assert.ifError(err);
@@ -696,7 +911,7 @@ describe('Metadata', function () {
       };
       var metadata = new Metadata(clientOptions.defaultOptions(), cc);
       metadata.keyspaces = { ks_tbl_meta: { tables: {}}};
-      async.timesSeries(100, function (n, next) {
+      utils.mapSeries(new Array(100), function (n, next) {
         metadata.getTable('ks_tbl_meta', 'tbl1', next);
       }, function (err, results) {
         assert.ifError(err);
@@ -706,6 +921,31 @@ describe('Metadata', function () {
         assert.strictEqual(results[0], null);
         assert.strictEqual(results[1], null);
         assert.strictEqual(results[99], null);
+        done();
+      });
+    });
+    it('should query each time if metadata retrieval flag is false', function (done) {
+      var tableRow = {"keyspace_name":"ks_tbl_meta","table_name":"tbl1","bloom_filter_fp_chance":0.01,"caching":{"keys":"ALL","rows_per_partition":"NONE"},"comment":"","compaction":{"min_threshold":"4","max_threshold":"32","class":"org.apache.cassandra.db.compaction.SizeTieredCompactionStrategy"},"compression":{"chunk_length_in_kb":"64","class":"org.apache.cassandra.io.compress.LZ4Compressor"},"dclocal_read_repair_chance":0.1,"default_time_to_live":0,"extensions":{},"flags":["compound"],"gc_grace_seconds":864000,"id":"7e0e8bf0-5862-11e5-84f8-c7d0c38d1d8d","max_index_interval":2048,"memtable_flush_period_in_ms":0,"min_index_interval":128,"read_repair_chance":0,"speculative_retry":"99PERCENTILE"};
+      var columnRows = [
+        {"keyspace_name": "ks_tbl_meta", "table_name": "tbl1", "column_name": "id", "clustering_order": "none", "column_name_bytes": "0x6964", "kind": "partition_key", "position": -1, "type": "uuid"},
+        {"keyspace_name": "ks_tbl_meta", "table_name": "tbl1", "column_name": "text_sample", "clustering_order": "none", "column_name_bytes": "0x746578745f73616d706c65", "kind": "regular", "position": -1, "type": "text"}
+      ];
+      var options = utils.extend({}, clientOptions.defaultOptions());
+      options.isMetadataSyncEnabled = false;
+      var cc = getControlConnectionForTable(tableRow, columnRows);
+      var metadata = new Metadata(options, cc);
+      metadata.keyspaces = { };
+      metadata.setCassandraVersion([3, 0]);
+      utils.mapSeries(new Array(100), function (n, next) {
+        metadata.getTable('ks_tbl_meta', 'tbl1', next);
+      }, function (err, results) {
+        assert.ifError(err);
+        assert.strictEqual(cc.queriedTable, 100);
+        assert.strictEqual(cc.queriedRows, 100);
+        assert.strictEqual(results.length, 100);
+        helper.assertInstanceOf(results[0], TableMetadata);
+        helper.assertInstanceOf(results[1], TableMetadata);
+        helper.assertInstanceOf(results[99], TableMetadata);
         done();
       });
     });
@@ -1280,7 +1520,7 @@ describe('Metadata', function () {
         };
         var metadata = new Metadata(clientOptions.defaultOptions(), cc);
         metadata.keyspaces['ks_udf'] = { functions: {}};
-        async.times(10, function (n, next) {
+        utils.times(10, function (n, next) {
           metadata.getFunctions('ks_udf', 'plus', function (err, funcArray) {
             assert.ifError(err);
             assert.ok(funcArray);
@@ -1308,7 +1548,7 @@ describe('Metadata', function () {
         };
         var metadata = new Metadata(clientOptions.defaultOptions(), cc);
         metadata.keyspaces['ks_udf'] = { functions: {}};
-        async.timesSeries(10, function (n, next) {
+        utils.timesSeries(10, function (n, next) {
           metadata.getFunctions('ks_udf', 'plus', function (err, funcArray) {
             assert.ifError(err);
             assert.ok(funcArray);
@@ -1341,7 +1581,7 @@ describe('Metadata', function () {
         };
         var metadata = new Metadata(clientOptions.defaultOptions(), cc);
         metadata.keyspaces['ks_udf'] = { functions: {}};
-        async.timesSeries(10, function (n, next) {
+        utils.timesSeries(10, function (n, next) {
           metadata.getFunctions('ks_udf', 'plus', function (err, funcArray) {
             assert.ifError(err);
             assert.ok(funcArray);
@@ -1380,7 +1620,7 @@ describe('Metadata', function () {
         };
         var metadata = new Metadata(clientOptions.defaultOptions(), cc);
         metadata.keyspaces['ks_udf'] = { functions: {}};
-        async.timesSeries(10, function (n, next) {
+        utils.timesSeries(10, function (n, next) {
           metadata.getFunctions('ks_udf', 'plus', function (err, funcArray) {
             if (n < 5) {
               assert.ok(err);
@@ -1536,7 +1776,7 @@ describe('Metadata', function () {
       };
       var metadata = new Metadata(clientOptions.defaultOptions(), cc);
       metadata.keyspaces['ks_udf'] = { functions: {}};
-      async.times(10, function (n, next) {
+      utils.times(10, function (n, next) {
         metadata.getFunction('ks_udf', 'plus', ['bigint', 'bigint'], function (err, func) {
           assert.ifError(err);
           assert.ok(func);
@@ -1565,7 +1805,7 @@ describe('Metadata', function () {
       };
       var metadata = new Metadata(clientOptions.defaultOptions(), cc);
       metadata.keyspaces['ks_udf'] = { functions: {}};
-      async.timesSeries(10, function (n, next) {
+      utils.timesSeries(10, function (n, next) {
         metadata.getFunction('ks_udf', 'plus', ['bigint', 'bigint'], function (err, func) {
           assert.ifError(err);
           assert.ok(func);
@@ -1659,7 +1899,7 @@ describe('Metadata', function () {
         };
         var metadata = new Metadata(clientOptions.defaultOptions(), cc);
         metadata.keyspaces['ks_udf'] = { aggregates: {}};
-        async.times(10, function (n, next) {
+        utils.times(10, function (n, next) {
           metadata.getAggregates('ks_udf', 'sum', function (err, funcArray) {
             assert.ifError(err);
             assert.ok(funcArray);
@@ -1687,7 +1927,7 @@ describe('Metadata', function () {
         };
         var metadata = new Metadata(clientOptions.defaultOptions(), cc);
         metadata.keyspaces['ks_udf'] = { aggregates: {}};
-        async.timesSeries(10, function (n, next) {
+        utils.timesSeries(10, function (n, next) {
           metadata.getAggregates('ks_udf', 'sum', function (err, funcArray) {
             assert.ifError(err);
             assert.ok(funcArray);
@@ -1720,7 +1960,7 @@ describe('Metadata', function () {
         };
         var metadata = new Metadata(clientOptions.defaultOptions(), cc);
         metadata.keyspaces['ks_udf'] = { aggregates: {}};
-        async.timesSeries(10, function (n, next) {
+        utils.timesSeries(10, function (n, next) {
           metadata.getAggregates('ks_udf', 'sum', function (err, funcArray) {
             assert.ifError(err);
             assert.ok(funcArray);
@@ -1760,7 +2000,7 @@ describe('Metadata', function () {
         };
         var metadata = new Metadata(clientOptions.defaultOptions(), cc);
         metadata.keyspaces['ks_udf'] = { aggregates: {}};
-        async.timesSeries(10, function (n, next) {
+        utils.timesSeries(10, function (n, next) {
           metadata.getAggregates('ks_udf', 'sum', function (err, funcArray) {
             if (n < 5) {
               assert.ok(err);
@@ -1910,17 +2150,54 @@ describe('Metadata', function () {
     });
   });
 });
+describe('SchemaParser', function () {
+  var isDoneForToken = rewire('../../lib/metadata/schema-parser')['__get__']('isDoneForToken');
+  describe('isDoneForToken()', function () {
+    it('should skip if dc not included in topology', function () {
+      var replicationFactors = { 'dc1': 3, 'dc2': 1 };
+      //dc2 does not exist
+      var datacenters = {
+        'dc1': { hostLength: 6 }
+      };
+      assert.strictEqual(false, isDoneForToken(replicationFactors, datacenters, {}));
+    });
+    it('should skip if rf equals to 0', function () {
+      //rf 0 for dc2
+      var replicationFactors = { 'dc1': 4, 'dc2': 0 };
+      var datacenters = {
+        'dc1': { hostLength: 6 },
+        'dc2': { hostLength: 6 }
+      };
+      assert.strictEqual(true, isDoneForToken(replicationFactors, datacenters, { 'dc1': 4 }));
+    });
+    it('should return false for undefined replicasByDc[dcName]', function () {
+      var replicationFactors = { 'dc1': 3, 'dc2': 1 };
+      //dc2 does not exist
+      var datacenters = {
+        'dc1': { hostLength: 6 }
+      };
+      assert.strictEqual(false, isDoneForToken(replicationFactors, datacenters, {}));
+    });
+  });
+});
 
 function getControlConnectionForTable(tableRow, columnRows, indexRows) {
   return {
+    queriedTable: 0,
+    queriedRows: 0,
+    queriedIndexes: 0,
     query: function (q, cb) {
+      var self = this;
       setImmediate(function () {
         if (q.indexOf('system.schema_columnfamilies') >= 0 || q.indexOf('system_schema.tables') >= 0) {
+          self.queriedTable++;
           return cb(null, { rows: [tableRow]});
         }
         if (q.indexOf('system_schema.indexes') >= 0) {
+          self.queriedIndexes++;
           return cb(null, { rows: (indexRows || [])});
         }
+        self.queriedRows++;
         cb(null, {rows: columnRows});
       });
     },
@@ -1937,4 +2214,20 @@ function getControlConnectionForRows(rows, protocolVersion) {
     },
     getEncoder: function () { return new Encoder(protocolVersion || 4, {}); }
   };
+}
+
+function getAddress(h) {
+  return h.address;
+}
+
+/**
+ * Creates a dummy tokenizer based on the first byte of the buffer.
+ * @returns {Murmur3Tokenizer}
+ */
+function getTokenizer() {
+  var t = new tokenizer.Murmur3Tokenizer();
+  //Use the first byte as token
+  t.hash = function (b) { return b[0]};
+  t.compare = function (a, b) { if (a > b) return 1; if (a < b) return -1; return 0 };
+  return t;
 }

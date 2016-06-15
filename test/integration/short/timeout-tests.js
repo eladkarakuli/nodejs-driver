@@ -1,6 +1,5 @@
 "use strict";
 var assert = require('assert');
-var async = require('async');
 
 var helper = require('../../test-helper');
 var Client = require('../../../lib/client');
@@ -8,63 +7,20 @@ var Connection = require('../../../lib/connection');
 var utils = require('../../../lib/utils');
 var types = require('../../../lib/types');
 var errors = require('../../../lib/errors');
+var ExecutionProfile = require('../../../lib/execution-profile').ExecutionProfile;
 
 describe('client read timeouts', function () {
   this.timeout(120000);
-  beforeEach(helper.ccmHelper.start(2));
-  afterEach(helper.ccmHelper.remove);
+  before(helper.ccmHelper.start(2));
+  after(helper.ccmHelper.remove);
+  afterEach(function (done) {
+    // Tests will pause node 2 and should resume it in the general case, but if for whatever reason they fail
+    // resuming the node here to be safe.
+    helper.ccmHelper.resumeNode(2, done);
+  });
   describe('when socketOptions.readTimeout is not set', function () {
-    it('should do nothing else than waiting', function (done) {
-      //set readTimeout to 0
-      var client = newInstance({ socketOptions: { readTimeout: 0 } });
-      var coordinators = {};
-      async.series([
-        client.connect.bind(client),
-        function warmup(next) {
-          async.timesSeries(10, function (n, timesNext) {
-            client.execute('SELECT key FROM system.local', function (err, result) {
-              if (err) return timesNext(err);
-              coordinators[helper.lastOctetOf(result.info.queriedHost)] = true;
-              timesNext();
-            });
-          }, next);
-        },
-        helper.toTask(helper.ccmHelper.pauseNode, null, 2),
-        function checkTimeouts(next) {
-          assert.strictEqual(Object.keys(coordinators).length, 2);
-          assert.strictEqual(coordinators['1'], true);
-          assert.strictEqual(coordinators['2'], true);
-          coordinators = {};
-          //execute 2 queries without waiting for the response
-          for (var i = 0; i < 2; i++) {
-            client.execute('SELECT key FROM system.local', function (err, result) {
-              assert.ifError(err);
-              coordinators[helper.lastOctetOf(result.info.queriedHost)] = true;
-            });
-          }
-          //wait for the node that is healthy to respond
-          setTimeout(next, 2000);
-        },
-        function checkWhenPaused(next) {
-          //the other callback is still waiting
-          assert.strictEqual(Object.keys(coordinators).length, 1);
-          assert.strictEqual(coordinators['1'], true);
-          next();
-        },
-        helper.toTask(helper.ccmHelper.resumeNode, null, 2),
-        function waitForResponse(next) {
-          // Wait for 2 seconds after resume for node to respond.
-          setTimeout(next, 2000);
-        },
-        function checkAfterResuming(next) {
-          assert.strictEqual(Object.keys(coordinators).length, 2);
-          assert.strictEqual(coordinators['1'], true);
-          assert.strictEqual(coordinators['2'], true);
-          next();
-        },
-        client.shutdown.bind(client)
-      ], done);
-    });
+    it('should do nothing else than waiting', getTimeoutErrorNotExpectedTest(false, false));
+    it('should use readTimeout when defined', getMoveNextHostTest(false, false, 3123, 0, { readTimeout: 3123 }));
   });
   describe('when socketOptions.readTimeout is set', function () {
     it('should move to next host by default for simple queries', getMoveNextHostTest(false, false));
@@ -75,10 +31,10 @@ describe('client read timeouts', function () {
       var client = newInstance({ socketOptions: { readTimeout: 3000 } });
       var coordinators = {};
       var errorsReceived = [];
-      async.series([
+      utils.series([
         client.connect.bind(client),
         function warmup(next) {
-          async.timesSeries(10, function (n, timesNext) {
+          utils.timesSeries(10, function (n, timesNext) {
             client.execute('SELECT key FROM system.local', function (err, result) {
               if (err) return timesNext(err);
               coordinators[helper.lastOctetOf(result.info.queriedHost)] = true;
@@ -92,7 +48,7 @@ describe('client read timeouts', function () {
           assert.strictEqual(coordinators['1'], true);
           assert.strictEqual(coordinators['2'], true);
           coordinators = {};
-          async.times(10, function (n, timesNext) {
+          utils.times(10, function (n, timesNext) {
             client.execute('SELECT key FROM system.local', [], { retryOnTimeout: false }, function (err, result) {
               if (err) {
                 errorsReceived.push(err);
@@ -135,10 +91,10 @@ describe('client read timeouts', function () {
       });
       var coordinators = {};
       var connection;
-      async.series([
+      utils.series([
         client.connect.bind(client),
         function warmup(next) {
-          async.times(10, function (n, timesNext) {
+          utils.times(10, function (n, timesNext) {
             client.execute('SELECT key FROM system.local', function (err, result) {
               if (err) return timesNext(err);
               coordinators[helper.lastOctetOf(result.info.queriedHost)] = true;
@@ -163,7 +119,7 @@ describe('client read timeouts', function () {
           assert.strictEqual(coordinators['1'], true);
           assert.strictEqual(coordinators['2'], true);
           coordinators = {};
-          async.times(500, function (n, timesNext) {
+          utils.times(500, function (n, timesNext) {
             client.execute('SELECT key FROM system.local', function (err, result) {
               if (err) return timesNext(err);
               coordinators[helper.lastOctetOf(result.info.queriedHost)] = true;
@@ -183,22 +139,122 @@ describe('client read timeouts', function () {
         client.shutdown.bind(client)
       ], done);
     });
+    it('should move to next host for eachRow() executions', function (done) {
+      var client = newInstance({ socketOptions: { readTimeout: 3000 } });
+      var coordinators = {};
+      utils.series([
+        client.connect.bind(client),
+        function warmup(next) {
+          utils.timesSeries(10, function (n, timesNext) {
+            var counter = 0;
+            client.eachRow('SELECT key FROM system.local', [], function () {
+              counter++;
+            }, function (err, result) {
+              if (err) return timesNext(err);
+              coordinators[helper.lastOctetOf(result.info.queriedHost)] = true;
+              assert.strictEqual(result.rowLength, counter);
+              timesNext();
+            });
+          }, next);
+        },
+        helper.toTask(helper.ccmHelper.pauseNode, null, 2),
+        function checkTimeouts(next) {
+          assert.strictEqual(Object.keys(coordinators).length, 2);
+          assert.strictEqual(coordinators['1'], true);
+          assert.strictEqual(coordinators['2'], true);
+          coordinators = {};
+          utils.times(10, function (n, timesNext) {
+            var counter = 0;
+            client.eachRow('SELECT key FROM system.local', [], function () {
+              counter++;
+            }, function (err, result) {
+              if (err) return timesNext(err);
+              coordinators[helper.lastOctetOf(result.info.queriedHost)] = true;
+              assert.strictEqual(result.rowLength, counter);
+              timesNext();
+            });
+          }, function (err) {
+            if (err) return next(err);
+            assert.strictEqual(Object.keys(coordinators).length, 1);
+            assert.strictEqual(coordinators['1'], true);
+            next();
+          });
+        },
+        helper.toTask(helper.ccmHelper.resumeNode, null, 2),
+        client.shutdown.bind(client)
+      ], done);
+    });
   });
+  describe('when queryOptions.readTimeout is set', function () {
+    function profiles() {
+      return [
+        new ExecutionProfile('aProfile', {readTimeout: 8675})
+      ];
+    }
+    it('should be used instead of socketOptions.readTimeout and profile.readTimeout for simple queries',
+      getMoveNextHostTest(false, false, 3123, 1 << 24, { executionProfile: 'aProfile', readTimeout: 3123 }, profiles()));
+    it('should be used instead of socketOptions.readTimeout and profile.readTimeout for prepared queries executions',
+      getMoveNextHostTest(true, true, 3123, 1 << 24, { executionProfile: 'aProfile', readTimeout: 3123 }, profiles()));
+    it('should suppress socketOptions.readTimeout and profile.readTimeout when set to 0 for simple queries',
+      getTimeoutErrorNotExpectedTest(false, false, 1000, { executionProfile: 'aProfile', readTimeout: 0}, profiles()));
+    it('should suppress socketOptions.readTimeout and profile.readTimeout when set to 0 for prepared queries executions',
+      getTimeoutErrorNotExpectedTest(true, true, 1000, { executionProfile: 'aProfile', readTimeout: 0}, profiles()));
+  });
+  describe('when executionProfile.readTimeout is set', function() {
+    function timeoutProfiles() {
+      return [
+        new ExecutionProfile('indefiniteTimeout', {readTimeout: 0}),
+        new ExecutionProfile('definedTimeout', {readTimeout: 3123})
+      ];
+    }
+    it('should be used instead of socketOptions.readTimeout for simple queries',
+      getMoveNextHostTest(false, false, 3123, 1 << 24, { executionProfile: 'definedTimeout' }, timeoutProfiles()));
+    it('should be used instead of socketOptions.readTimeout for prepared queries executions',
+      getMoveNextHostTest(true, true, 3123, 1 << 24, { executionProfile: 'definedTimeout' }, timeoutProfiles()));
+    it('should suppress socketOptions.readTimeout when set to 0 for simple queries',
+      getTimeoutErrorNotExpectedTest(false, false, 1000, { executionProfile: 'indefiniteTimeout'}, timeoutProfiles()));
+    it('should suppress socketOptions.readTimeout when set to 0 for prepared queries executions',
+      getTimeoutErrorNotExpectedTest(true, true, 1000, { executionProfile: 'indefiniteTimeout'}, timeoutProfiles()));
+  })
 });
+
 
 /** @returns {Client}  */
 function newInstance(options) {
   return new Client(utils.extend({}, helper.baseOptions, options));
 }
 
-function getMoveNextHostTest(prepare, prepareWarmup) {
-  return (function (done) {
-    var client = newInstance({ socketOptions: { readTimeout: 3000 } });
+/**
+ * @param {Boolean} prepare
+ * @param {Boolean} prepareWarmup
+ * @param {Number} [expectedTimeoutMillis]
+ * @param {Number} [readTimeout]
+ * @param {QueryOptions} [queryOptions]
+ * @param {Array.<ExecutionProfile>} [profiles]
+ * @returns {Function}
+ */
+function getMoveNextHostTest(prepare, prepareWarmup, expectedTimeoutMillis, readTimeout, queryOptions, profiles) {
+  if (!expectedTimeoutMillis) {
+    expectedTimeoutMillis = 3000;
+  }
+  if (!readTimeout) {
+    readTimeout = 3000;
+  }
+  profiles = profiles || [];
+  return (function moveNextHostTest(done) {
+    var client = newInstance({ profiles: profiles, socketOptions: { readTimeout: readTimeout } });
+    var timeoutLogs = [];
+    client.on('log', function (level, constructorName, info) {
+      if (level !== 'warning' || info.indexOf('timeout') === -1) {
+        return;
+      }
+      timeoutLogs.push(info);
+    });
     var coordinators = {};
-    async.series([
+    utils.series([
       client.connect.bind(client),
       function warmup(next) {
-        async.timesSeries(10, function (n, timesNext) {
+        utils.timesSeries(10, function (n, timesNext) {
           client.execute('SELECT key FROM system.local', [], { prepare: prepareWarmup }, function (err, result) {
             if (err) return timesNext(err);
             coordinators[helper.lastOctetOf(result.info.queriedHost)] = true;
@@ -212,20 +268,91 @@ function getMoveNextHostTest(prepare, prepareWarmup) {
         assert.strictEqual(coordinators['1'], true);
         assert.strictEqual(coordinators['2'], true);
         coordinators = {};
-        async.times(10, function (n, timesNext) {
-          client.execute('SELECT key FROM system.local', [], { prepare: prepare }, function (err, result) {
+        var testAbortTimeout = setTimeout(function () {
+          throw new Error('It should have been executed in the next (not paused) host.');
+        }, expectedTimeoutMillis * 4);
+        utils.times(10, function (n, timesNext) {
+          queryOptions = utils.extend({ }, queryOptions, { prepare: prepare});
+          client.execute('SELECT key FROM system.local', [], queryOptions, function (err, result) {
             if (err) return timesNext(err);
             coordinators[helper.lastOctetOf(result.info.queriedHost)] = true;
             timesNext();
           });
-        }, function (err) {
+        }, function timeFinished(err) {
+          clearTimeout(testAbortTimeout);
           if (err) return next(err);
           assert.strictEqual(Object.keys(coordinators).length, 1);
           assert.strictEqual(coordinators['1'], true);
+          assert.ok(timeoutLogs.length);
+          //check that the logs messages contains the actual millis value
+          assert.ok(timeoutLogs.reduce(function (val, current) {
+            return val || current.indexOf(expectedTimeoutMillis.toString()) >= 0;
+          }, false), 'Timeout millis not found');
           next();
         });
       },
       helper.toTask(helper.ccmHelper.resumeNode, null, 2),
+      client.shutdown.bind(client)
+    ], done);
+  });
+}
+
+function getTimeoutErrorNotExpectedTest(prepare, prepareWarmup, readTimeout, queryOptions, profiles) {
+  if (typeof readTimeout === 'undefined') {
+    readTimeout = 0;
+  }
+
+  profiles = profiles || [];
+
+  return (function timeoutErrorNotExpectedTest(done) {
+    var client = newInstance({ profiles: profiles, socketOptions: { readTimeout: readTimeout } });
+    var coordinators = {};
+    utils.series([
+      client.connect.bind(client),
+      function warmup(next) {
+        utils.timesSeries(10, function (n, timesNext) {
+          client.execute('SELECT key FROM system.local', [], { prepare: prepareWarmup }, function (err, result) {
+            if (err) return timesNext(err);
+            coordinators[helper.lastOctetOf(result.info.queriedHost)] = true;
+            timesNext();
+          });
+        }, next);
+      },
+      helper.toTask(helper.ccmHelper.pauseNode, null, 2),
+      function checkTimeouts(next) {
+        assert.strictEqual(Object.keys(coordinators).length, 2);
+        assert.strictEqual(coordinators['1'], true);
+        assert.strictEqual(coordinators['2'], true);
+        coordinators = {};
+        //execute 2 queries without waiting for the response
+        for (var i = 0; i < 2; i++) {
+          queryOptions = utils.extend({ }, queryOptions, { prepare: prepare });
+          client.execute('SELECT key FROM system.local', [], queryOptions, function (err, result) {
+            assert.ifError(err);
+            coordinators[helper.lastOctetOf(result.info.queriedHost)] = true;
+          });
+        }
+        //wait for the node that is healthy to respond
+        setTimeout(next, 2000);
+      },
+      function checkWhenPaused(next) {
+        //the other callback is still waiting
+        assert.strictEqual(Object.keys(coordinators).length, 1);
+        assert.strictEqual(coordinators['1'], true);
+        next();
+      },
+      helper.toTask(helper.ccmHelper.resumeNode, null, 2),
+      function waitForResponse(next) {
+        // Wait for 2 seconds after resume for node to respond.
+        setTimeout(next, 2000);
+      },
+      function checkAfterResuming(next) {
+        // Should get responses from each coordinator since no requests should have timed out.
+        assert.strictEqual(Object.keys(coordinators).length, 2);
+        assert.strictEqual(coordinators['1'], true);
+        assert.strictEqual(coordinators['2'], true);
+        next();
+      },
       client.shutdown.bind(client)
     ], done);
   });

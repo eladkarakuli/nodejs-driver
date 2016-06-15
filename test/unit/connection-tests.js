@@ -1,6 +1,5 @@
 "use strict";
 var assert = require('assert');
-var async = require('async');
 var util = require('util');
 var events = require('events');
 var rewire = require('rewire');
@@ -13,6 +12,22 @@ var utils = require('../../lib/utils.js');
 var helper = require('../test-helper.js');
 
 describe('Connection', function () {
+  describe('constructor', function () {
+    it('should parse host endpoint into address and port', function () {
+      var values = [
+        ['127.0.0.1:9042', '127.0.0.1', '9042'],
+        ['10.1.1.255:8888', '10.1.1.255', '8888'],
+        ['::1:8888', '::1', '8888'],
+        ['::1:1234', '::1', '1234'],
+        ['aabb::eeff:11:2233:4455:6677:8899:9999', 'aabb::eeff:11:2233:4455:6677:8899', '9999']
+      ];
+      values.forEach(function (item) {
+        var c = new Connection(item[0], 4, defaultOptions);
+        assert.strictEqual(c.address, item[1]);
+        assert.strictEqual(c.port, item[2]);
+      });
+    });
+  });
   describe('#prepareOnce()', function () {
     function prepareAndAssert(connection, query) {
       return (function (cb) {
@@ -31,7 +46,7 @@ describe('Connection', function () {
           cb(null, r.query);
         });
       };
-      async.parallel([
+      utils.parallel([
         prepareAndAssert(connection, 'QUERY1'),
         prepareAndAssert(connection, 'QUERY2'),
         prepareAndAssert(connection, 'QUERY3')
@@ -49,7 +64,7 @@ describe('Connection', function () {
           cb(null, r.query);
         });
       };
-      async.parallel([
+      utils.parallel([
         prepareAndAssert(connection, 'QUERY1'),
         prepareAndAssert(connection, 'QUERY2'),
         prepareAndAssert(connection, 'QUERY3')
@@ -68,7 +83,7 @@ describe('Connection', function () {
           cb(null, r.query);
         });
       };
-      async.parallel([
+      utils.parallel([
         prepareAndAssert(connection, 'QUERY1'),
         prepareAndAssert(connection, 'QUERY1'),
         prepareAndAssert(connection, 'QUERY1')
@@ -89,7 +104,7 @@ describe('Connection', function () {
           cb(null, r.query);
         });
       };
-      async.parallel([
+      utils.parallel([
         prepareAndAssert(connection, 'QUERY1'),
         prepareAndAssert(connection, 'QUERY1'),
         prepareAndAssert(connection, 'QUERY1')
@@ -203,6 +218,7 @@ describe('Connection', function () {
         assert.ifError(err);
         assert.ok(c.connected);
         //it is now connected
+        //noinspection JSUnresolvedVariable
         var socket = c.netClient;
         var closeEmitted = 0;
         socket.on('close', function () {
@@ -244,6 +260,7 @@ describe('Connection', function () {
         assert.ok(c.connected);
         //force destroy
         c.connected = false;
+        //noinspection JSUnresolvedVariable
         var socket = c.netClient;
         var closeEmitted = 0;
         socket.on('close', function () {
