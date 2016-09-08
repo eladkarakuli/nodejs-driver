@@ -369,6 +369,45 @@ describe('Client', function () {
         helper.ccmHelper.remove
       ], done);
     });
+    function getReceiveNotificationTest(nodeNumber) {
+      return (function receiveNotificationTest(done) {
+        // Should receive notification when a node gracefully closes connections
+        var client = newInstance({
+          pooling: {
+            warmup: true,
+            heartBeatInterval: 0,
+            // Use just 1 connection per host for all protocol versions in this test
+            coreConnectionsPerHost: clientOptions.coreConnectionsPerHostV3
+          }
+        });
+        utils.series([
+          helper.ccmHelper.removeIfAny,
+          helper.ccmHelper.start(2),
+          client.connect.bind(client),
+          function checkInitialState(next) {
+            var hosts = client.hosts.values();
+            assert.ok(hosts[0].isUp());
+            assert.ok(hosts[1].isUp());
+            next();
+          },
+          function stopNode(next) {
+            helper.ccmHelper.stopNode(nodeNumber, next);
+          },
+          helper.delay(300),
+          function checkThatStateChanged(next) {
+            // Only 1 node should be UP
+            assert.strictEqual(client.hosts.values().filter(function (h) {
+              return h.isUp();
+            }).length, 1);
+            next();
+          },
+          client.shutdown.bind(client),
+          helper.ccmHelper.remove
+        ], done);
+      });
+    }
+    it('should receive socket closed event and set node as down', getReceiveNotificationTest(2));
+    it('should receive socket closed event and set node as down (control connection node)', getReceiveNotificationTest(1));
   });
   describe('#execute()', function () {
     before(helper.ccmHelper.start(3));
@@ -389,8 +428,8 @@ describe('Client', function () {
     });
     it('should fail to execute if the keyspace does not exists', function (done) {
       var client = new Client(utils.extend({}, helper.baseOptions, {keyspace: 'NOT____EXISTS'}));
-      //on all hosts
-      utils.times(10, function (n, next) {
+      // Execute on all hosts, some executions in parallel and some serial
+      utils.timesLimit(12, 6, function (n, next) {
         //No matter what, the keyspace does not exists
         client.execute(helper.queries.basic, function (err) {
           helper.assertInstanceOf(err, Error);
@@ -637,7 +676,7 @@ describe('Client', function () {
               assert.deepEqual(getPoolInfo(client), expectedState);
               if (ignoredHost === '1') {
                 // The control connection should have changed
-                assert.ok(cc.isClosed);
+                assert.ok(!cc.connected);
                 assert.notStrictEqual(helper.lastOctetOf(client.controlConnection.host), '1');
               }
               else {
@@ -848,11 +887,8 @@ describe('Client', function () {
             });
           }, next);
         },
-        function startNode3(next) {
-          helper.waitOnHost(function () {
-            helper.ccmHelper.startNode(3);
-          }, client, 3, 'up', helper.wait(5000, next));
-        },
+        helper.toTask(helper.ccmHelper.startNode, null, 3),
+        helper.waitOnHostUp(client, 3),
         function assertReconnected(next) {
           assert.strictEqual('3', helper.lastOctetOf(client.controlConnection.host));
           client.hosts.forEach(function (host) {
@@ -930,7 +966,7 @@ describe('Client', function () {
 
 /** @returns {Client}  */
 function newInstance(options) {
-  return new Client(utils.extend({}, helper.baseOptions, options));
+  return new Client(utils.deepExtend({}, helper.baseOptions, options));
 }
 
 /**

@@ -92,16 +92,12 @@ describe('ControlConnection', function () {
       var cc = newInstance({ policies: { loadBalancing: new TestLoadBalancing() } });
       utils.series([
         cc.init.bind(cc),
-        function (next) {
-          //wait for all initial events
-          setTimeout(next, 5000);
-        },
-        function (next) {
-          helper.waitOnHost(function () {
-            //noinspection JSCheckFunctionSignatures
-            helper.ccmHelper.stopNode(2);
-          }, cc, 2, 'down', next);
-        },
+        helper.delay(2000 + (helper.isWin() ? 13000 : 0)),
+        // Don't stop the node until we know it's up.
+        helper.waitOnHostUp(cc, 2),
+        // Stop the node and ensure it gets marked down.
+        helper.toTask(helper.ccmHelper.stopNode, null, 2),
+        helper.waitOnHostDown(cc, 2),
         function (next) {
           var hosts = cc.hosts.slice(0);
           assert.strictEqual(hosts.length, 2);
@@ -121,24 +117,11 @@ describe('ControlConnection', function () {
       var cc = newInstance(options, 1, 1);
       utils.series([
         cc.init.bind(cc),
-        function (next) {
-          //add a node
-          helper.ccmHelper.bootstrapNode(3, next);
-        },
-        function (next) {
-          //start the node
-          helper.ccmHelper.startNode(3, helper.wait(5000, next));
-        },
-        function (next) {
-          // While the host is started, it's not a given that it will have been connected and marked up,
-          // wait for that to be the case.
-          var host3 = helper.findHost(cc, 3);
-          if(!host3.isUp()) {
-            helper.waitOnHost(helper.noop, cc, 3, 'up', next);
-          } else {
-            next();
-          }
-        },
+        helper.toTask(helper.ccmHelper.bootstrapNode, null, 3),
+        helper.toTask(helper.ccmHelper.startNode, null, 3),
+        // While the host is started, it's not a given that it will have been connected and marked up,
+        // wait for that to be the case.
+        helper.waitOnHostUp(cc, 3),
         function (next) {
           var hosts = cc.hosts.slice(0);
           var countUp = hosts.reduce(function (value, host) {
@@ -154,10 +137,8 @@ describe('ControlConnection', function () {
       var cc = newInstance();
       utils.series([
         cc.init.bind(cc),
-        function (next) {
-          //decommission node
-          helper.ccmHelper.exec(['node2', 'decommission'], helper.wait(5000, next));
-        },
+        helper.toTask(helper.ccmHelper.decommissionNode, null, 2),
+        helper.waitOnHostGone(cc, 2),
         function (next) {
           var hosts = cc.hosts.slice(0);
           assert.strictEqual(hosts.length, 1);
@@ -166,41 +147,44 @@ describe('ControlConnection', function () {
       ], done);
     });
     it('should reconnect when host used goes down', function (done) {
-      var cc = newInstance();
+      var options = clientOptions.extend(
+        utils.extend({ pooling: helper.getPoolingOptions(1, 1, 500) }, helper.baseOptions));
+      var cc = new ControlConnection(options, new ProfileManager(options));
       var host1;
+      var host2;
+      var lbp;
       utils.series([
         cc.init.bind(cc),
         function initLbp(next) {
-          cc.options.policies.loadBalancing.init(null, cc.hosts, next);
+          lbp = cc.options.policies.loadBalancing;
+          lbp.init(null, cc.hosts, next);
         },
         function ensureConnected(next) {
-          // there should be a single connection to the first host
           var hosts = cc.hosts.values();
+          hosts.forEach(function (h) {
+            h.setDistance(lbp.getDistance(h));
+          });
           assert.strictEqual(hosts.length, 2);
-          assert.strictEqual(hosts[0].pool.connections.length, 1);
-          assert.strictEqual(hosts[1].pool.connections.length, 0);
           host1 = hosts[0];
+          host2 = hosts[1];
+          // there should be a single connection to the first host
+          assert.strictEqual(host1.pool.connections.length, 1);
+          assert.strictEqual(host2.pool.connections.length, 0);
           next();
         },
-        helper.toTask(helper.ccmHelper.exec, null, ['node1', 'stop']),
-        function ensureDown(next) {
-          // connections to host1 could be down or not
-          if (host1.pool.connections.length === 0) {
-            return next();
-          }
-          // close the connection
-          host1.setDown();
-          setTimeout(next, 5000);
-        },
+        helper.toTask(helper.ccmHelper.stopNode, null, 1),
+        helper.waitOnHostDown(cc, 1),
         function assertions(next) {
-          var hosts = cc.hosts.values();
-          assert.strictEqual(hosts.length, 2);
-          var countUp = hosts.reduce(function (value, host) {
-            value += host.isUp() ? 1 : 0;
-            return value;
-          }, 0);
-          assert.strictEqual(countUp, 1);
+          assert.strictEqual(host1.pool.connections.length, 0,
+            'Host1 should be DOWN and connections closed (heartbeat enabled)');
           assert.strictEqual(host1.isUp(), false);
+          assert.strictEqual(host2.isUp(), true);
+          assert.strictEqual(host1.pool.connections.length, 0);
+          assert.strictEqual(host2.pool.connections.length, 1);
+          next();
+        },
+        function shutdown(next) {
+          cc.shutdown();
           next();
         }
       ], done);
@@ -222,28 +206,15 @@ describe('ControlConnection', function () {
           cc.host.setDistance(distance);
           next();
         },
-        function stop1(next) {
-          helper.ccmHelper.stopNode(1, next);
-        },
-        function stop2(next) {
-          helper.ccmHelper.stopNode(2, helper.wait(5000, next));
-        },
-        function setDownManually(next) {
-          //help in case the event didn't fired by socket disconnection
-          cc.hosts.forEach(function (h) {
-            if (h.pool.connections.length === 1) {
-              h.removeFromPool(h.pool.connections[0]);
-            }
-          });
-          assert.strictEqual(cc.host, null);
-          next();
-        },
-        function restart(next) {
-          helper.waitOnHost(function () {
-            //noinspection JSCheckFunctionSignatures
-            helper.ccmHelper.startNode(2);
-          }, cc, 2, 'up', helper.wait(5000, next));
-        },
+        // stop nodes 1 and 2 and make sure they both go down.
+        helper.toTask(helper.ccmHelper.stopNode, null, 1),
+        helper.waitOnHostDown(cc, 1),
+        helper.toTask(helper.ccmHelper.stopNode, null, 2),
+        helper.waitOnHostDown(cc, 2),
+        // restart node 2 and make sure it comes up.
+        helper.toTask(helper.ccmHelper.startNode, null, 2),
+        helper.waitOnHostUp(cc, 2),
+        // check that host 1 is down, host 2 is up and the control connection is to host 2.
         function checkHostConnected(next) {
           cc.hosts.forEach(function (h) {
             if (helper.lastOctetOf(h) === '1') {
@@ -281,7 +252,7 @@ describe('ControlConnection', function () {
 
 /** @returns {ControlConnection} */
 function newInstance(options, localConnections, remoteConnections) {
-  options = clientOptions.extend(utils.extend({ pooling: { coreConnectionsPerHost: {}}}, helper.baseOptions, options));
+  options = clientOptions.extend(utils.deepExtend({ pooling: { coreConnectionsPerHost: {}}}, helper.baseOptions, options));
   //disable the heartbeat
   options.pooling.heartBeatInterval = 0;
   options.pooling.coreConnectionsPerHost[types.distance.local] = localConnections || 2;
